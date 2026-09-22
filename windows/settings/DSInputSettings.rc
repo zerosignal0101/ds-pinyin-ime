@@ -5,7 +5,7 @@
 IDI_DSIME ICON "../dsime.ico"
 
 // A simple, resizable-free modal dialog. Units are dialog units (DLU).
-IDD_SETTINGS DIALOGEX 0, 0, 320, 280
+IDD_SETTINGS DIALOGEX 0, 0, 320, 374
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "DS Input Settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -33,14 +33,37 @@ BEGIN
     LTEXT           "Thinking:",        -1,           164, 118,  46, 10
     EDITTEXT                            IDC_THINKING, 212, 116,  98, 12, ES_AUTOHSCROLL
 
-    LTEXT           "System prompt:",   -1,            10, 136,  90, 10
-    EDITTEXT                            IDC_SYSTEM_PROMPT, 10, 148, 300, 80,
+    CONTROL         "Stream the answer as it arrives", IDC_STREAM, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 90, 133, 220, 10
+
+    LTEXT           "System prompt:",   -1,            10, 150,  90, 10
+    EDITTEXT                            IDC_SYSTEM_PROMPT, 10, 162, 300, 70,
                     ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
 
-    LTEXT           "",                 IDC_CONFIG_PATH, 10, 232, 300, 10
-    LTEXT           "",                 IDC_STATUS,    10, 244, 220, 10
+    GROUPBOX        "Context",          -1,            10, 240, 300, 100
 
-    PUSHBUTTON      "Test",             IDC_TEST,      10, 258,  50, 14
-    DEFPUSHBUTTON   "Save",             IDOK,         200, 258,  50, 14
-    PUSHBUTTON      "Cancel",           IDCANCEL,     258, 258,  50, 14
+    CONTROL         "Remember what is typed, per window", IDC_CONTEXT_ENABLED,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 20, 254, 200, 10
+
+    LTEXT           "Window tokens:",   -1,            20, 272,  60, 10
+    EDITTEXT                            IDC_CONTEXT_WINDOW_TOKENS, 84, 270, 50, 12,
+                    ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Keep recent turns:", -1,         146, 272,  66, 10
+    EDITTEXT                            IDC_CONTEXT_KEEP_RECENT, 216, 270, 40, 12,
+                    ES_AUTOHSCROLL | ES_NUMBER
+
+    LTEXT           "Queue max:",       -1,            20, 290,  60, 10
+    EDITTEXT                            IDC_QUEUE_MAX_PENDING, 84, 288, 50, 12,
+                    ES_AUTOHSCROLL | ES_NUMBER
+
+    PUSHBUTTON      "Clear stored context", IDC_CLEAR_CONTEXT, 20, 310, 110, 14
+    LTEXT           "Context records what you type, including\na copy on disk. Clearing it cannot be undone.",
+                    -1, 138, 306, 166, 22
+
+    LTEXT           "",                 IDC_CONFIG_PATH, 10, 344, 300, 10
+    LTEXT           "",                 IDC_STATUS,    10, 358, 130, 10
+
+    PUSHBUTTON      "Test",             IDC_TEST,     148, 356,  46, 14
+    DEFPUSHBUTTON   "Save",             IDOK,         200, 356,  50, 14
+    PUSHBUTTON      "Cancel",           IDCANCEL,     258, 356,  50, 14
 END

@@ -24,3 +24,9 @@
 #define IDC_STATUS          211
 #define IDC_SAVE            212   // maps to IDOK in the dialog
 #define IDC_TEST            213   // runs a sample conversion against current fields
+#define IDC_STREAM          219   // stream the conversion (SSE)
+#define IDC_CONTEXT_ENABLED 214   // remember a per-window conversation context
+#define IDC_CONTEXT_WINDOW_TOKENS 215
+#define IDC_CONTEXT_KEEP_RECENT   216
+#define IDC_QUEUE_MAX_PENDING     217
+#define IDC_CLEAR_CONTEXT   218   // forget every stored context, now

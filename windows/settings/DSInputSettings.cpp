@@ -130,6 +130,23 @@ std::string JsonGetNumber(const std::string& json, const std::string& key) {
     return num;
 }
 
+// Find a top-level boolean: "key": true|false. Falls back when absent.
+//
+// This needs its own reader: JsonGetString would see no quote after the colon
+// and happily run on to the NEXT key's opening quote, returning that key's name.
+bool JsonGetBool(const std::string& json, const std::string& key, bool fallback) {
+    std::string needle = "\"" + key + "\"";
+    size_t k = json.find(needle);
+    if (k == std::string::npos) return fallback;
+    size_t colon = json.find(':', k + needle.size());
+    if (colon == std::string::npos) return fallback;
+    size_t i = colon + 1;
+    while (i < json.size() && (json[i] == ' ' || json[i] == '\t')) ++i;
+    if (json.compare(i, 4, "true") == 0) return true;
+    if (json.compare(i, 5, "false") == 0) return false;
+    return fallback;
+}
+
 // ---- dialog field <-> control glue ----------------------------------------
 
 std::wstring GetText(HWND dlg, int id) {
@@ -144,9 +161,48 @@ void SetText(HWND dlg, int id, const std::wstring& s) {
     ::SetDlgItemTextW(dlg, id, s.c_str());
 }
 
+void SetCheck(HWND dlg, int id, bool on) {
+    ::SendDlgItemMessageW(dlg, id, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+bool GetCheck(HWND dlg, int id) {
+    return ::SendDlgItemMessageW(dlg, id, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
 // The engine is shared by the dialog proc via a single global for simplicity
 // (this is a one-window, one-engine process).
 dsime::Engine g_engine;
+
+// Config fields the dialog does not surface.
+//
+// They are read back at load time and re-emitted unchanged on save, because
+// saving does not *merge*: ds_engine_set_config_json replaces the whole object,
+// and the core's serde defaults then fill anything the new object omitted. A
+// field we dropped would not be "left alone" — it would silently snap back to
+// its default. `context_prompt` is the one that would hurt: it is a long,
+// carefully tuned prompt, and a user who edited it by hand should not lose it by
+// opening this dialog and pressing Save.
+//
+// (The rule generalises: every field in core::config::Config must appear either
+// in the dialog or here.)
+struct HiddenFields {
+    std::string context_prompt;
+    std::string context_compact_ratio;
+    std::string context_max_windows;
+};
+HiddenFields g_hidden;
+
+// Fields with the CONTEXT_ENABLED checkbox as their master switch.
+const int kContextDependents[] = {
+    IDC_CONTEXT_WINDOW_TOKENS, IDC_CONTEXT_KEEP_RECENT, IDC_CLEAR_CONTEXT,
+};
+
+void SyncContextEnable(HWND dlg) {
+    const BOOL on = GetCheck(dlg, IDC_CONTEXT_ENABLED) ? TRUE : FALSE;
+    for (int id : kContextDependents) {
+        ::EnableWindow(::GetDlgItem(dlg, id), on);
+    }
+}
 
 void LoadIntoDialog(HWND dlg) {
     dsime::CoreString json = g_engine.GetConfigJson();
@@ -162,11 +218,30 @@ void LoadIntoDialog(HWND dlg) {
     SetText(dlg, IDC_REASONING_EFFORT, dsime::Utf8ToUtf16(JsonGetString(j, "reasoning_effort")));
     SetText(dlg, IDC_THINKING,      dsime::Utf8ToUtf16(JsonGetString(j, "thinking")));
 
+    SetCheck(dlg, IDC_STREAM, JsonGetBool(j, "stream", true));
+    SetCheck(dlg, IDC_CONTEXT_ENABLED, JsonGetBool(j, "context_enabled", true));
+    SetText(dlg, IDC_CONTEXT_WINDOW_TOKENS,
+            dsime::Utf8ToUtf16(JsonGetNumber(j, "context_window_tokens")));
+    SetText(dlg, IDC_CONTEXT_KEEP_RECENT,
+            dsime::Utf8ToUtf16(JsonGetNumber(j, "context_keep_recent")));
+    SetText(dlg, IDC_QUEUE_MAX_PENDING,
+            dsime::Utf8ToUtf16(JsonGetNumber(j, "queue_max_pending")));
+
+    g_hidden.context_prompt        = JsonGetString(j, "context_prompt");
+    g_hidden.context_compact_ratio = JsonGetNumber(j, "context_compact_ratio");
+    g_hidden.context_max_windows   = JsonGetNumber(j, "context_max_windows");
+
+    SyncContextEnable(dlg);
+
     dsime::CoreString path = g_engine.ConfigPath();
     SetText(dlg, IDC_CONFIG_PATH, L"Config: " + path.to_wstring());
 }
 
 // Build the JSON config object from the current dialog fields.
+//
+// EVERY field of core::config::Config has to be emitted here (or carried in
+// g_hidden). The core replaces the whole object on save, and its serde defaults
+// fill whatever is missing — so an omitted field is not preserved, it is reset.
 std::string BuildConfigJson(HWND dlg) {
     std::string base_url   = dsime::Utf16ToUtf8(GetText(dlg, IDC_BASE_URL));
     std::string api_key    = dsime::Utf16ToUtf8(GetText(dlg, IDC_API_KEY));
@@ -181,10 +256,17 @@ std::string BuildConfigJson(HWND dlg) {
     std::string reasoning  = dsime::Utf16ToUtf8(GetText(dlg, IDC_REASONING_EFFORT));
     std::string thinking   = dsime::Utf16ToUtf8(GetText(dlg, IDC_THINKING));
 
+    std::string ctx_window = dsime::Utf16ToUtf8(GetText(dlg, IDC_CONTEXT_WINDOW_TOKENS));
+    std::string ctx_recent = dsime::Utf16ToUtf8(GetText(dlg, IDC_CONTEXT_KEEP_RECENT));
+    std::string queue_max  = dsime::Utf16ToUtf8(GetText(dlg, IDC_QUEUE_MAX_PENDING));
+
     // Default numeric fields if the user blanked them, so the JSON stays valid.
     if (temp.empty())       temp = "0.3";
     if (max_tokens.empty()) max_tokens = "1024";
     if (timeout.empty())    timeout = "8000";
+    if (ctx_window.empty()) ctx_window = "16384";
+    if (ctx_recent.empty()) ctx_recent = "10";
+    if (queue_max.empty())  queue_max = "8";
 
     std::string json;
     json += "{\n";
@@ -196,7 +278,31 @@ std::string BuildConfigJson(HWND dlg) {
     json += "  \"max_tokens\": "      + max_tokens + ",\n";
     json += "  \"reasoning_effort\": \"" + JsonEscape(reasoning) + "\",\n";
     json += "  \"thinking\": \""      + JsonEscape(thinking) + "\",\n";
-    json += "  \"timeout_ms\": "      + timeout    + "\n";
+    json += "  \"timeout_ms\": "      + timeout    + ",\n";
+    // std::string(...) rather than a bare ternary: a char* + char* is pointer
+    // arithmetic, not concatenation.
+    json += "  \"stream\": " + std::string(GetCheck(dlg, IDC_STREAM) ? "true" : "false") + ",\n";
+    json += "  \"context_enabled\": " +
+            std::string(GetCheck(dlg, IDC_CONTEXT_ENABLED) ? "true" : "false") + ",\n";
+    json += "  \"context_window_tokens\": " + ctx_window + ",\n";
+    json += "  \"context_keep_recent\": "   + ctx_recent + ",\n";
+
+    // Carried through untouched from what the core last handed us. Emitted only
+    // when non-empty: a *missing* field takes the core's default, whereas an
+    // empty one would be taken literally (an empty compaction prompt, a ratio of
+    // 0). Better to omit than to corrupt.
+    if (!g_hidden.context_prompt.empty()) {
+        json += "  \"context_prompt\": \"" + JsonEscape(g_hidden.context_prompt) + "\",\n";
+    }
+    if (!g_hidden.context_compact_ratio.empty()) {
+        json += "  \"context_compact_ratio\": " + g_hidden.context_compact_ratio + ",\n";
+    }
+    if (!g_hidden.context_max_windows.empty()) {
+        json += "  \"context_max_windows\": " + g_hidden.context_max_windows + ",\n";
+    }
+
+    // Last, and therefore the one line without a trailing comma.
+    json += "  \"queue_max_pending\": " + queue_max + "\n";
     json += "}\n";
     return json;
 }
@@ -366,6 +472,27 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
                     ::EnableWindow(bTest, TRUE);
                     ::EnableWindow(bSave, TRUE);
                     ::EnableWindow(bCancel, TRUE);
+                    return TRUE;
+                }
+                case IDC_CONTEXT_ENABLED:
+                    SyncContextEnable(dlg);
+                    return TRUE;
+                case IDC_CLEAR_CONTEXT: {
+                    // Immediate, not tied to Save: it is a deletion, and the user
+                    // should see it happen when they ask for it.
+                    const int answer = ::MessageBoxW(
+                        dlg,
+                        L"Forget the remembered context for every window?\n\n"
+                        L"This deletes the stored record of what you have typed, "
+                        L"including the copy on disk. It cannot be undone.",
+                        L"DS Input", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+                    if (answer != IDYES) return TRUE;
+                    if (g_engine.ClearContexts() == DS_OK) {
+                        SetText(dlg, IDC_STATUS, L"Stored context cleared.");
+                    } else {
+                        SetText(dlg, IDC_STATUS,
+                                L"Could not clear context: " + dsime::LastError());
+                    }
                     return TRUE;
                 }
                 case IDCANCEL:

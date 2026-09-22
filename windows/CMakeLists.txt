@@ -25,6 +25,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Unicode everywhere (TSF + Win32 wide APIs).
 add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+# Windows 10. Pinned rather than left to the SDK's default so the API surface we
+# compile against is the surface we require — QueryFullProcessImageName (Vista)
+# and GetDpiForWindow (1607) are both declared on the strength of this. Anything
+# newer is resolved dynamically; see InputWindow.cpp.
+add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+
 # ---- locate the Rust core artifacts ---------------------------------------
 # The Cargo build drops dsime.dll + its import lib here. Override on the command
 # line with -DDSIME_CORE_DIR=... if you build the core elsewhere.
@@ -61,9 +67,10 @@ add_library(dsime_tsf SHARED
     KeyEventSink.cpp
     Composition.cpp
     EditSessions.cpp
-    DisplayAttribute.cpp
+    InputWindow.cpp
     LangBarButton.cpp
     Registry.cpp
+    Trace.cpp
     dsime_tsf.rc
 )
 

@@ -1,7 +1,7 @@
 /*
  * dsime.h — C ABI for the DS Input core engine (Rust crate `dsime`).
  *
- * Stable interface shared by every platform frontend (macOS IMKit, Windows TSF).
+ * Stable interface shared by every platform frontend (Windows TSF today).
  * All strings are UTF-8, NUL-terminated. Pointers returned by the library that
  * are documented as "caller frees" MUST be released with ds_string_free().
  *
@@ -87,6 +87,23 @@ int32_t   ds_engine_set_config_json(DsEngine *engine, const char *json_utf8);
 /* The configured config file path (caller frees). */
 char     *ds_engine_config_path(DsEngine *engine);
 
+/* Forget every remembered input window's conversation context, in memory and on
+ * disk. Returns DS_OK or DS_ERR_CONFIG.
+ *
+ * The context is a record of what the user has typed — including a copy on disk
+ * beside the config file — so callers need a way to be rid of it that does not
+ * mean hunting for files. */
+int32_t   ds_engine_clear_contexts(DsEngine *engine);
+
+/* How many conversions the frontend should let pile up before it stops
+ * accepting more (config `queue_max_pending`). Returns 0 for a NULL engine,
+ * which the caller should read as "no bound" rather than "reject everything".
+ *
+ * The queue itself lives in the frontend — only it can decide on its UI thread
+ * whether to take another sentence — so this is the one number it needs from
+ * the core to enforce the configured depth. */
+uint32_t  ds_engine_queue_max_pending(DsEngine *engine);
+
 /* ---- Session lifecycle --------------------------------------------------- */
 
 DsSession *ds_session_new(DsEngine *engine);
@@ -98,6 +115,14 @@ void       ds_session_set_input(DsSession *session, const char *pinyin_ascii);
 /* The current raw pinyin buffer (caller frees). Never NULL. */
 char      *ds_session_get_input(DsSession *session);
 
+/* Name the input window this session is typing into, e.g. "code.exe|Chrome_WidgetWin_1".
+ * The conversation context is filed under this key, so the model keeps seeing the
+ * domain, terminology and wording of what is already written in that window, and
+ * starts clean in a different one. Set it before each conversion: one session
+ * outlives any single document. An empty key (or never calling this) disables
+ * context for that request. The string is copied — the caller keeps ownership. */
+void       ds_session_set_context_key(DsSession *session, const char *key_utf8);
+
 /* Kick off async conversion of the current buffer. Cancels any previous
  * in-flight request for this session. Returns a monotonic request id, or 0 if
  * the buffer is empty (callback is not invoked in that case).
@@ -106,7 +131,12 @@ char      *ds_session_get_input(DsSession *session);
  * invoked exactly once, on a worker thread. If a newer request (or a cancel /
  * reset) supersedes this one before it finishes, the callback still fires, with
  * status DS_ERR_CANCELLED. This lets the frontend safely tie per-request
- * resources (e.g. a retained context pointer) to the callback. */
+ * resources (e.g. a retained context pointer) to the callback.
+ *
+ * ds_engine_free() honours this too: it cancels outstanding work and waits
+ * (bounded) for the pending callbacks to land before tearing the engine down.
+ * The wait is capped, so a frontend that cannot tolerate even that should
+ * release its per-request resources without relying on the callback. */
 uint64_t   ds_session_convert(DsSession *session,
                               DsConvertCallback callback,
                               void *user_data);
@@ -151,12 +181,6 @@ void       ds_session_cancel(DsSession *session);
 
 /* Clear the buffer and cancel in-flight work (call after commit / escape). */
 void       ds_session_reset(DsSession *session);
-
-/* Returns 1 when the current (uncommitted) buffer is at/over the configured
- * max_context_tokens budget, else 0. The frontend should flush (commit) and
- * start a fresh session before accepting more input so each request stays small
- * and the cached system-prompt prefix stays effective. */
-int32_t    ds_session_context_full(DsSession *session);
 
 /* ---- Utilities ----------------------------------------------------------- */
 

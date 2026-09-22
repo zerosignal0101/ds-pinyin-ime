@@ -133,6 +133,15 @@ public:
     CoreString ConfigPath() const {
         return CoreString(e_ ? ds_engine_config_path(e_) : nullptr);
     }
+    // Configured queue depth (config `queue_max_pending`). The queue is the
+    // frontend's, so this is the one number it needs from the core to enforce
+    // the bound. 0 means "no bound".
+    uint32_t QueueMaxPending() const {
+        return e_ ? ds_engine_queue_max_pending(e_) : 0;
+    }
+    // Forget every remembered window's conversation context, in memory and on
+    // disk.
+    int32_t ClearContexts() { return e_ ? ds_engine_clear_contexts(e_) : DS_ERR_CONFIG; }
 
     void reset() {
         if (e_) { ds_engine_free(e_); e_ = nullptr; }
@@ -175,10 +184,13 @@ public:
         return CoreString(s_ ? ds_session_get_input(s_) : nullptr);
     }
 
-    // True when the current buffer is at/over the configured context-token budget;
-    // the frontend should flush (commit) and start fresh before adding more input.
-    bool ContextFull() const {
-        return s_ ? ds_session_context_full(s_) != 0 : false;
+    // Name the input window this session is typing into, e.g.
+    // "code.exe|Chrome_WidgetWin_1". The conversation context is filed under this
+    // key, so the model keeps seeing the domain and terminology of what is
+    // already written in that window. Set it before each conversion; the core
+    // copies the string. Empty (the default) disables context for the request.
+    void SetContextKey(const std::string& key_utf8) {
+        if (s_) ds_session_set_context_key(s_, key_utf8.c_str());
     }
 
     // Kick off async conversion. callback fires on a CORE WORKER THREAD; it must

@@ -4,6 +4,7 @@
 
 mod api;
 mod config;
+mod context;
 mod engine;
 
 pub use engine::{Engine, EngineHandle, Session};
@@ -140,6 +141,44 @@ pub unsafe extern "C" fn ds_engine_config_path(engine: *mut EngineHandle) -> *mu
     to_c_string(e.config_path().to_string_lossy().into_owned())
 }
 
+/// Forget every remembered input window's conversation context — both the
+/// in-memory copy and the files on disk. Returns `DS_OK`, or `DS_ERR_CONFIG` for
+/// a NULL engine.
+///
+/// The context is a record of what the user has typed, so there has to be a way
+/// to be rid of it that does not mean hunting for files.
+///
+/// # Safety
+/// `engine` is a valid pointer from `ds_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn ds_engine_clear_contexts(engine: *mut EngineHandle) -> i32 {
+    match engine_ref(engine) {
+        Some(e) => {
+            e.clear_contexts();
+            0
+        }
+        None => 5, // DS_ERR_CONFIG
+    }
+}
+
+/// How many conversions the frontend should let pile up before it stops
+/// accepting more (config `queue_max_pending`).
+///
+/// The frontend owns the queue — only it can decide on the UI thread whether to
+/// take another sentence — so the bound it enforces has to be readable from
+/// here. Returns 0 for a NULL engine, which the caller should read as "no
+/// bound" rather than "reject everything".
+///
+/// # Safety
+/// `engine` is a valid pointer from `ds_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn ds_engine_queue_max_pending(engine: *mut EngineHandle) -> u32 {
+    match engine_ref(engine) {
+        Some(e) => e.config_snapshot().queue_max_pending,
+        None => 0,
+    }
+}
+
 // ---- Session lifecycle -----------------------------------------------------
 
 /// # Safety
@@ -178,6 +217,26 @@ unsafe fn session_ref<'a>(session: *mut Session) -> Option<&'a Session> {
 pub unsafe extern "C" fn ds_session_set_input(session: *mut Session, pinyin_ascii: *const c_char) {
     if let (Some(s), Some(p)) = (session_ref(session), cstr(pinyin_ascii)) {
         s.set_input(p);
+    }
+}
+
+/// Name the input window this session is typing into. The conversation context
+/// is filed under this key, so the model keeps seeing the domain, terminology
+/// and style of what is already written in that window — and starts clean in a
+/// new one. Call it before each conversion: one session outlives any single
+/// document, so this cannot be set once at creation.
+///
+/// An empty key (or never calling this) disables context for that request.
+///
+/// # Safety
+/// `session` is valid; `key_utf8` is a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ds_session_set_context_key(
+    session: *mut Session,
+    key_utf8: *const c_char,
+) {
+    if let (Some(s), Some(k)) = (session_ref(session), cstr(key_utf8)) {
+        s.set_context_key(k);
     }
 }
 
@@ -353,20 +412,6 @@ pub unsafe extern "C" fn ds_session_cancel(session: *mut Session) {
 pub unsafe extern "C" fn ds_session_reset(session: *mut Session) {
     if let Some(s) = session_ref(session) {
         s.reset();
-    }
-}
-
-/// Returns 1 when the current (uncommitted) buffer is at/over the configured
-/// `max_context_tokens` budget, else 0. The frontend should flush (commit) and
-/// start a fresh session before accepting more input so requests stay small.
-///
-/// # Safety
-/// `session` is a valid pointer from `ds_session_new`.
-#[no_mangle]
-pub unsafe extern "C" fn ds_session_context_full(session: *mut Session) -> i32 {
-    match session_ref(session) {
-        Some(s) if s.context_full() => 1,
-        _ => 0,
     }
 }
 

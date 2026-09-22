@@ -49,10 +49,18 @@ foreach ($f in $files) {
         # while those processes live. On NTFS the loaded image can be renamed
         # aside — the running process keeps its handle and keeps working from the
         # renamed file — which is exactly how the guided installer handles this.
-        $old = "$target.old"
         Log "   $f is in use — renaming the loaded copy aside"
+        # A loaded image can be *renamed* but never deleted or overwritten, so a
+        # previous run's aside-copy is still sitting there and still cannot be
+        # budged while its process lives — the name stays taken until reboot.
+        # Try to reclaim it, and if we can't, take a fresh name instead of
+        # failing the whole install on a collision with our own leftovers.
+        $old = "$target.old"
         Remove-Item $old -Force -ErrorAction SilentlyContinue
-        Move-Item $target $old -Force
+        if (Test-Path -LiteralPath $old) {
+            $old = "$target.old." + [guid]::NewGuid().ToString("N").Substring(0, 8)
+        }
+        Move-Item -LiteralPath $target -Destination $old -Force
         Copy-Item $source $target -Force
         $swapped += $f
     }
@@ -61,6 +69,8 @@ foreach ($f in $files) {
 if ($swapped.Count -gt 0) {
     Log "   NOTE: $($swapped -join ', ') were in use; apps holding them keep the"
     Log "         OLD build until they are restarted (or you sign out)."
+    Log "         The renamed originals (*.old*) can be deleted once those"
+    Log "         processes are gone — they are unreachable before that."
 }
 
 # ── 2. Register the COM/TSF in-proc server ─────────────────────────────────

@@ -11,18 +11,42 @@ type:      nihaoshijie, woshiyigechengxuyuan
 committed: 你好世界，我是一个程序员
 ```
 
-Nothing is converted while you type: the pre‑edit shows exactly the pinyin (and
-punctuation) you entered, with no network traffic in the background. Space is the
-single trigger — it sends the whole buffer to the model and writes the returned
-sentence in one step.
+Nothing is converted while you type: the pinyin lives in a **floating input box
+of our own**, the document is not touched at all, and there is no network
+traffic in the background. Space is the single trigger — it hands the buffer to
+a queue and the pinyin disappears immediately, so you carry straight on with the
+next sentence. Conversions run **one at a time, in order**, and each result is
+written back where its sentence was typed.
+
+That last part is what keeps a search box from querying on every keystroke: the
+document changes only when a finished Chinese sentence lands in it.
 
 | Key | Effect |
 |-----|--------|
-| `a`–`z`, `'`, `,` `.` `?` `!` `;` `:` `(` `)` `\` | append to the buffer (shown as the underlined pre‑edit) |
-| **Space** | convert the whole buffer and write the result — convert and commit in one step |
+| `a`–`z`, `'`, `,` `.` `?` `!` `;` `:` `(` `)` `\` | append to the buffer (shown in the floating box) |
+| **Space** | convert the whole buffer and write the result; typing continues immediately |
 | **Enter** | write the buffer verbatim, no conversion (for English, identifiers, …) |
-| **Esc** | discard everything; nothing is written |
+| **Esc** | discard what is being typed; the queue keeps running |
 | **Backspace** | edit the buffer |
+
+The box also shows how many conversions are still queued. A result that cannot
+be written (the document was closed, or became read‑only) is put on the
+clipboard, and the box says so rather than dropping the sentence.
+
+## Context
+
+The model is given a **per‑input‑window** history of what has already been
+converted, so it picks up the domain, terminology and wording of the document it
+is filling in. Windows are keyed by application (`code.exe|Chrome_WidgetWin_1`),
+which means every Chrome tab shares one context — the point is industry
+vocabulary, which is a property of the app, not of a tab.
+
+The history grows append‑only (which is what lets the provider's prefix cache
+hit) and is summarised automatically once it outgrows
+`context_window_tokens × context_compact_ratio`. Context is **persisted to disk**
+beside the config file, so it accumulates across restarts. It is on by default,
+can be switched off, and can be cleared from Settings — the context is a record
+of what you typed, so there has to be a way to be rid of it.
 
 ## Architecture
 
@@ -32,10 +56,11 @@ sentence in one step.
 | Windows frontend | [`windows/`](windows/) | C++ + Text Services Framework | see `windows/README.md` |
 
 The core owns everything OS‑independent: the pinyin buffer state machine, the
-async OpenAI‑compatible client, config load/save, and single‑in‑flight
-cancellation. The frontend is thin: capture keys, render the inline pre‑edit,
-commit text, host Settings. The one contract between them is
-[`core/include/dsime.h`](core/include/dsime.h). See [`DESIGN.md`](DESIGN.md).
+async OpenAI‑compatible client, config load/save, the conversation context and
+its compaction, and single‑in‑flight cancellation. The frontend captures keys,
+draws the floating box, and runs the conversion queue. The one contract between
+them is [`core/include/dsime.h`](core/include/dsime.h). See
+[`DESIGN.md`](DESIGN.md).
 
 ## Quick start (core)
 

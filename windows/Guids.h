@@ -32,12 +32,10 @@ DEFINE_GUID(c_clsidDsimeTextService,
 DEFINE_GUID(c_guidDsimeProfile,
     0xa1b2c3d4, 0x55e6, 0x47f8, 0x89, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd);
 
-// {B2C3D4E5-66F7-4809-9A12-3456789ABCDE}
-// GUID for our composition display attribute (the underline style applied to the
-// in-progress pre-edit text). Registered with the display-attribute category and
-// returned by our ITfDisplayAttributeProvider.
-DEFINE_GUID(c_guidDsimeDisplayAttribute,
-    0xb2c3d4e5, 0x66f7, 0x4809, 0x9a, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde);
+// NB: {B2C3D4E5-66F7-4809-9A12-3456789ABCDE} used to be our composition
+// display attribute (the pre-edit underline). It is gone: the composition is
+// zero-width and nothing is ever drawn into the document, so there is nothing
+// to underline. The value is deliberately not reused.
 
 // {C3D4E5F6-7708-491A-AB23-456789ABCDEF}
 // GUID identifying our language-bar item button (the system-tray / language-bar

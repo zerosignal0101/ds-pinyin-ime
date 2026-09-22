@@ -1,8 +1,18 @@
 //! OpenAI-compatible chat-completions client used to convert pinyin → Chinese.
 
 use crate::config::Config;
+use crate::context::WindowContext;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::time::Duration;
+
+/// Wraps the compacted context note so the model can tell it apart from the
+/// sentence it is being asked to convert. A constant, so the message stays
+/// byte-stable from one request to the next — the cache matches whole prefix
+/// units, and any edit to an earlier message invalidates everything after it.
+const CONTEXT_SUMMARY_LEAD: &str =
+    "Context from earlier in this same input window. Use it only to disambiguate \
+     terminology, names and style; it is not text to continue or repeat:";
 
 /// Error categories mirrored to the C `DS_ERR_*` status codes.
 #[derive(Debug)]
@@ -71,29 +81,60 @@ struct ThinkingRequest<'a> {
 #[derive(Serialize)]
 struct ChatMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    /// `Cow` so the one derived message (the context-summary lead-in) can be
+    /// assembled on the fly while everything else stays borrowed.
+    content: Cow<'a, str>,
+}
+
+/// Token accounting as the provider reports it. Anchors the context estimate on
+/// a real count rather than a local guess — see `WindowContext::estimated_tokens`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
+}
+
+/// A finished conversion: the sanitized text plus what it cost.
+#[derive(Debug, Clone)]
+pub struct Completed {
+    pub text: String,
+    pub usage: Usage,
 }
 
 #[derive(Deserialize)]
 struct ChatResponse {
+    #[serde(default)]
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Usage,
 }
 
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChoiceMessage,
+    /// `"length"` when the model ran out of budget — the case that comes back as
+    /// empty content rather than an error.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChoiceMessage {
+    #[serde(default)]
     content: String,
 }
 
 /// One SSE chunk of a streamed completion: `{"choices":[{"delta":{"content":"…"}}]}`.
+/// Providers that report `usage` at the end of a stream are taken up on it; the
+/// rest fall back to the token estimate.
 #[derive(Deserialize)]
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -137,26 +178,48 @@ fn regen_instruction(exclude: &[String]) -> Option<String> {
     ))
 }
 
-/// System prompt + user pinyin, plus an optional regeneration instruction.
+/// System prompt, the window's context, then the pinyin — plus an optional
+/// regeneration instruction.
+///
+/// Order is cost-relevant: the system prompt and the context summary are the
+/// most stable part of the prefix, the append-only turn history follows, and the
+/// volatile regeneration instruction goes last. A regeneration therefore never
+/// invalidates the cacheable prefix.
 fn build_messages<'a>(
     cfg: &'a Config,
+    ctx: &'a WindowContext,
     pinyin: &'a str,
     regen: &'a Option<String>,
 ) -> Vec<ChatMessage<'a>> {
-    let mut messages = vec![
-        ChatMessage {
+    let mut messages = Vec::with_capacity(4 + ctx.turns.len() * 2);
+    messages.push(ChatMessage {
+        role: "system",
+        content: Cow::Borrowed(&cfg.system_prompt),
+    });
+    if let Some(summary) = &ctx.summary {
+        messages.push(ChatMessage {
             role: "system",
-            content: &cfg.system_prompt,
-        },
-        ChatMessage {
+            content: Cow::Owned(format!("{CONTEXT_SUMMARY_LEAD}\n{summary}")),
+        });
+    }
+    for turn in &ctx.turns {
+        messages.push(ChatMessage {
             role: "user",
-            content: pinyin,
-        },
-    ];
+            content: Cow::Borrowed(&turn.pinyin),
+        });
+        messages.push(ChatMessage {
+            role: "assistant",
+            content: Cow::Borrowed(&turn.chinese),
+        });
+    }
+    messages.push(ChatMessage {
+        role: "user",
+        content: Cow::Borrowed(pinyin),
+    });
     if let Some(instr) = regen {
         messages.push(ChatMessage {
             role: "system",
-            content: instr,
+            content: Cow::Borrowed(instr),
         });
     }
     messages
@@ -234,27 +297,22 @@ fn thinking_params(cfg: &Config) -> (Option<ThinkingRequest<'_>>, Option<&str>) 
 }
 
 /// Send one conversion request. `client` is a shared, connection-pooled client.
-/// `exclude` lists already-shown conversions to avoid (empty for the normal path;
-/// non-empty when regenerating an alternative).
+/// `ctx` is the window's conversation context — pass `ContextSnapshot::default()`
+/// for none. `exclude` lists already-shown conversions to avoid (empty for the
+/// normal path; non-empty when regenerating an alternative).
 pub async fn convert(
     client: &reqwest::Client,
     cfg: &Config,
+    ctx: &WindowContext,
     pinyin: &str,
     exclude: &[String],
-) -> Result<String, ConvertError> {
-    if cfg.api_key.trim().is_empty() {
-        return Err(ConvertError::Config(
-            "API key is not set — open Settings and add your key".to_string(),
-        ));
-    }
-
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+) -> Result<Completed, ConvertError> {
     let regen = regen_instruction(exclude);
     let (temperature, max_tokens, max_completion_tokens) = token_params(cfg, exclude);
     let (thinking, reasoning_effort) = thinking_params(cfg);
     let body = ChatRequest {
         model: &cfg.model,
-        messages: build_messages(cfg, pinyin, &regen),
+        messages: build_messages(cfg, ctx, pinyin, &regen),
         temperature,
         max_tokens,
         max_completion_tokens,
@@ -263,11 +321,65 @@ pub async fn convert(
         stream: false,
     };
 
+    let (content, finish_reason, usage) = post_chat(client, cfg, &body).await?;
+    let text = sanitize(&content);
+    if text.is_empty() {
+        return Err(empty_completion(finish_reason.as_deref()));
+    }
+    Ok(Completed { text, usage })
+}
+
+/// Fold a window's history into a short context note, replacing everything older
+/// than the turns the caller keeps.
+///
+/// The request is the same conversation the conversions send, plus the
+/// compaction instruction as a final user message — so it shares a prefix with
+/// the normal requests and hits the same cache entry.
+pub async fn compact_context(
+    client: &reqwest::Client,
+    cfg: &Config,
+    ctx: &WindowContext,
+) -> Result<String, ConvertError> {
+    let (temperature, max_tokens, max_completion_tokens) = token_params(cfg, &[]);
+    let (thinking, reasoning_effort) = thinking_params(cfg);
+    let body = ChatRequest {
+        model: &cfg.model,
+        messages: build_messages(cfg, ctx, &cfg.context_prompt, &None),
+        temperature,
+        max_tokens,
+        max_completion_tokens,
+        thinking,
+        reasoning_effort,
+        stream: false,
+    };
+
+    let (content, finish_reason, _) = post_chat(client, cfg, &body).await?;
+    let summary = extract_summary(&content);
+    if summary.is_empty() {
+        return Err(empty_completion(finish_reason.as_deref()));
+    }
+    Ok(summary)
+}
+
+/// POST one non-streaming chat request. Returns the first choice's content, its
+/// `finish_reason`, and the usage the provider reported.
+async fn post_chat(
+    client: &reqwest::Client,
+    cfg: &Config,
+    body: &ChatRequest<'_>,
+) -> Result<(String, Option<String>, Usage), ConvertError> {
+    if cfg.api_key.trim().is_empty() {
+        return Err(ConvertError::Config(
+            "API key is not set — open Settings and add your key".to_string(),
+        ));
+    }
+
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
         .bearer_auth(&cfg.api_key)
         .timeout(Duration::from_millis(cfg.timeout_ms))
-        .json(&body)
+        .json(body)
         .send()
         .await
         .map_err(|e| ConvertError::Network(e.to_string()))?;
@@ -291,29 +403,75 @@ pub async fn convert(
 
     let parsed: ChatResponse =
         serde_json::from_str(&text).map_err(|e| ConvertError::Api(format!("bad response: {e}")))?;
-
-    let content = parsed
+    let choice = parsed
         .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content)
         .ok_or_else(|| ConvertError::Api("empty choices".to_string()))?;
+    Ok((choice.message.content, choice.finish_reason, parsed.usage))
+}
 
-    Ok(sanitize(&content))
+/// An empty completion is a failure, not a success.
+///
+/// A reasoning model spends `max_tokens` on its hidden chain of thought before
+/// emitting anything; when the budget runs out the reply comes back empty with
+/// `finish_reason: "length"`. Reporting that as `Ok("")` made the IME look like
+/// it had silently done nothing — and would have recorded an empty turn into the
+/// conversation context.
+fn empty_completion(finish_reason: Option<&str>) -> ConvertError {
+    let why = match finish_reason {
+        Some("length") => {
+            " (finish_reason: length — the budget ran out, most likely consumed by \
+             the model's hidden reasoning)"
+        }
+        Some(other) => other,
+        None => "",
+    };
+    ConvertError::Api(format!(
+        "the model returned an empty conversion{why}; raise `max_tokens` in Settings"
+    ))
+}
+
+/// Pull the `<summary>` block out of a compaction reply, dropping the
+/// `<analysis>` scratchpad. Both are the shape `DEFAULT_CONTEXT_PROMPT` asks for;
+/// only the summary is stored, so the model's reasoning never enters the context.
+fn extract_summary(raw: &str) -> String {
+    let text = raw.trim();
+    if let Some(start) = text.find("<summary>") {
+        let rest = &text[start + "<summary>".len()..];
+        let body = rest.split("</summary>").next().unwrap_or(rest);
+        return body.trim().to_string();
+    }
+    // No tags at all: strip any scratchpad and keep what is left.
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<analysis>") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</analysis>") {
+            Some(end) => rest = &rest[start + end + "</analysis>".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 /// Stream a conversion (SSE, `stream: true`). `on_delta` is called with the
 /// *cumulative* text each time the model emits more, so the frontend can replace
-/// the pre-edit incrementally. Returns the final sanitized text. The cumulative
-/// text passed to `on_delta` is raw (not sanitized) so partial quotes/whitespace
-/// may appear; only the returned final value is sanitized.
+/// the pre-edit incrementally. The cumulative text passed to `on_delta` is raw
+/// (not sanitized) so partial quotes/whitespace may appear; only the returned
+/// final value is sanitized.
 pub async fn convert_stream<F>(
     client: &reqwest::Client,
     cfg: &Config,
+    ctx: &WindowContext,
     pinyin: &str,
     exclude: &[String],
     mut on_delta: F,
-) -> Result<String, ConvertError>
+) -> Result<Completed, ConvertError>
 where
     F: FnMut(&str),
 {
@@ -329,7 +487,7 @@ where
     let (thinking, reasoning_effort) = thinking_params(cfg);
     let body = ChatRequest {
         model: &cfg.model,
-        messages: build_messages(cfg, pinyin, &regen),
+        messages: build_messages(cfg, ctx, pinyin, &regen),
         temperature,
         max_tokens,
         max_completion_tokens,
@@ -365,6 +523,7 @@ where
     // chunk boundary is never decoded mid-sequence.
     let mut buf: Vec<u8> = Vec::new();
     let mut acc = String::new();
+    let mut usage = Usage::default();
     while let Some(chunk) = resp
         .chunk()
         .await
@@ -383,9 +542,16 @@ where
                 continue;
             }
             if payload == "[DONE]" {
-                return Ok(sanitize(&acc));
+                let text = sanitize(&acc);
+                if text.is_empty() {
+                    return Err(empty_completion(None));
+                }
+                return Ok(Completed { text, usage });
             }
             if let Ok(parsed) = serde_json::from_str::<StreamChunk>(payload) {
+                if let Some(reported) = parsed.usage {
+                    usage = reported;
+                }
                 if let Some(piece) = parsed
                     .choices
                     .into_iter()
@@ -401,7 +567,11 @@ where
         }
     }
 
-    Ok(sanitize(&acc))
+    let text = sanitize(&acc);
+    if text.is_empty() {
+        return Err(empty_completion(None));
+    }
+    Ok(Completed { text, usage })
 }
 
 /// Models sometimes wrap output in quotes or trailing whitespace; strip that so

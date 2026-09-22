@@ -11,6 +11,16 @@
 
 #include <windows.h>
 
+// A rect that carries no usable position.
+//
+// This is worth a named helper because the failure is silent: GetTextExt (and
+// GetScreenExt) return S_OK *and* an all-zero rect when the window is minimised
+// or the text has no layout yet. Testing the HRESULT is not enough — callers
+// must test the rect.
+inline bool IsDegenerate(const RECT& r) {
+    return r.right <= r.left && r.bottom <= r.top;
+}
+
 extern HINSTANCE g_hInst;     // module handle (set in DllMain)
 extern LONG      g_cRefDll;   // outstanding object + lock count
 

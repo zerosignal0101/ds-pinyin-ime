@@ -11,7 +11,10 @@
 //   GUID_TFCAT_TIPCAP_SECUREMODE             — usable on the secure desktop.
 //   GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT       — works in immersive (UWP) apps.
 //   GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT         — shows in the system tray.
-//   GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER      — we provide display attributes.
+//
+// We no longer register a display-attribute provider: the composition is
+// zero-width and the pre-edit lives in our own floating box, so there is nothing
+// in the document to underline.
 
 #include "Registry.h"
 #include "Guids.h"
@@ -137,7 +140,6 @@ BOOL RegisterTsfCategories() {
         &GUID_TFCAT_TIPCAP_SECUREMODE,
         &GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
         &GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
-        &GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
     };
 
     BOOL ok = TRUE;
@@ -163,7 +165,6 @@ BOOL UnregisterTsfCategories() {
         &GUID_TFCAT_TIPCAP_SECUREMODE,
         &GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
         &GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
-        &GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
     };
     for (const GUID* cat : kCategories) {
         pCat->UnregisterCategory(c_clsidDsimeTextService, *cat,

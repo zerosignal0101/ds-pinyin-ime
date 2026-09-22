@@ -3,12 +3,18 @@
 
 use crate::api;
 use crate::config::Config;
+use crate::context::{ContextStore, WindowContext};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::Notify;
+
+/// How long `ds_engine_free` waits for pending conversion callbacks to land
+/// before giving up and letting the runtime be dropped. Frontends balance
+/// per-request resources on that callback, so a swallowed terminal is a leak.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Outcome handed back to the FFI layer's callback.
 pub struct ConvertOutcome {
@@ -24,7 +30,7 @@ fn finalize(
     active_gen: &AtomicU64,
     my_gen: u64,
     request_id: u64,
-    result: Result<String, api::ConvertError>,
+    result: Result<api::Completed, api::ConvertError>,
 ) -> ConvertOutcome {
     if active_gen.load(Ordering::SeqCst) != my_gen {
         let e = api::ConvertError::Cancelled;
@@ -35,10 +41,10 @@ fn finalize(
         };
     }
     match result {
-        Ok(text) => ConvertOutcome {
+        Ok(completed) => ConvertOutcome {
             request_id,
             status: 0, // DS_OK
-            text,
+            text: completed.text,
         },
         Err(e) => ConvertOutcome {
             request_id,
@@ -61,6 +67,52 @@ pub struct Engine {
     client: reqwest::Client,
     config: RwLock<Arc<Config>>,
     config_path: PathBuf,
+    /// Per-window conversation context, persisted next to the config.
+    contexts: ContextStore,
+    /// Cancel tokens of the live sessions, so shutdown can reach their in-flight
+    /// work. `Weak`, so a freed session is simply skipped.
+    sessions: Mutex<Vec<Weak<SessionControl>>>,
+    /// Conversion tasks spawned but not yet finished delivering.
+    inflight: AtomicUsize,
+    idle_lock: Mutex<()>,
+    idle: Condvar,
+}
+
+/// The cancel state shared between a [`Session`] and its in-flight task.
+///
+/// `Arc`-shared rather than living directly in the `Session` so that an in-flight
+/// task keeps it alive after the session is freed — and so
+/// [`EngineHandle::drop`] can reach it through the engine's registry without
+/// borrowing the session, which may already be gone.
+struct SessionControl {
+    /// Bumping this cancels the outstanding request: `finalize` reports any
+    /// result whose generation has moved as `DS_ERR_CANCELLED`.
+    active_gen: AtomicU64,
+    /// Wakes a parked `select!` arm so a cancelled request need not wait out its
+    /// HTTP timeout before reporting.
+    wake: Notify,
+}
+
+impl SessionControl {
+    fn new() -> SessionControl {
+        SessionControl {
+            active_gen: AtomicU64::new(0),
+            wake: Notify::new(),
+        }
+    }
+
+    /// Cancel the outstanding request and claim the next generation for a new one.
+    fn claim(&self) -> u64 {
+        let gen = self.active_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.wake.notify_waiters();
+        gen
+    }
+
+    /// Cancel the outstanding request, waking it if it is parked.
+    fn cancel(&self) {
+        self.active_gen.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
 }
 
 /// Owns the Tokio [`Runtime`] plus a strong reference to the shared [`Engine`].
@@ -101,12 +153,22 @@ impl EngineHandle {
             .build()
             .map_err(|e| format!("failed to build http client: {e}"))?;
 
+        // Context files live beside the config file, so a caller that points the
+        // core at its own config path (the CLI example, tests) keeps its contexts
+        // with it instead of in the real user profile.
+        let contexts = ContextStore::new(config_path.parent().map(|p| p.join("context")));
+
         let engine = Arc::new(Engine {
             // Tasks spawn onto this handle; the Runtime itself stays in `rt`.
             rt: rt.handle().clone(),
             client,
             config: RwLock::new(Arc::new(config)),
             config_path,
+            contexts,
+            sessions: Mutex::new(Vec::new()),
+            inflight: AtomicUsize::new(0),
+            idle_lock: Mutex::new(()),
+            idle: Condvar::new(),
         });
         Ok(EngineHandle { _rt: rt, engine })
     }
@@ -120,6 +182,23 @@ impl EngineHandle {
     /// session keeps the engine state alive independently of this handle.
     pub fn engine_arc(&self) -> Arc<Engine> {
         Arc::clone(&self.engine)
+    }
+}
+
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
+        // Why this is a hand-written `Drop` rather than field declaration order:
+        // dropping the `Runtime` cancels its spawned tasks, and a cancelled task
+        // never reaches its `deliver` call. The "exactly once" contract in
+        // `dsime.h` is what frontends hang per-request resources on — the TSF
+        // frontend's `AddRef`, the Settings window's wait loop — so a swallowed
+        // terminal is a leak, not merely a lost result.
+        //
+        // Cancel everything, give the deliveries a bounded moment to land, and
+        // only then let the fields drop (`_rt` first, which is what actually
+        // shuts the runtime down).
+        self.engine.cancel_all();
+        self.engine.wait_for_idle(SHUTDOWN_DRAIN_TIMEOUT);
     }
 }
 
@@ -150,6 +229,118 @@ impl Engine {
         *self.config.write().unwrap() = Arc::new(cfg);
         Ok(())
     }
+
+    /// Forget every window's conversation context, on disk and in memory.
+    pub fn clear_contexts(&self) {
+        self.contexts.clear_all();
+    }
+
+    /// Track a session's cancel token, so shutdown can reach its in-flight work.
+    fn register_session(&self, control: &Arc<SessionControl>) {
+        let mut list = self.sessions.lock().unwrap();
+        // Drop entries whose session and task are both gone, so the list stays
+        // proportional to live sessions rather than to sessions ever created.
+        list.retain(|w| w.strong_count() > 0);
+        list.push(Arc::downgrade(control));
+    }
+
+    /// Count a spawned conversion task in, so `wait_for_idle` knows to wait.
+    fn task_started(&self) {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Count a finished conversion task out. Called *after* `deliver`, so seeing
+    /// zero means every outstanding callback has already been made.
+    fn task_finished(&self) {
+        if self.inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _guard = self.idle_lock.lock().unwrap();
+            self.idle.notify_all();
+        }
+    }
+
+    /// Cancel the outstanding request of every live session.
+    fn cancel_all(&self) {
+        let live: Vec<Arc<SessionControl>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for control in live {
+            control.cancel();
+        }
+    }
+
+    /// Block until no conversion task is outstanding, or `timeout` elapses.
+    ///
+    /// Normally returns immediately: the callers that matter (`Deactivate`) cancel
+    /// first, and a cancelled request reports without waiting out its HTTP
+    /// timeout. The bound exists so a wedged task can never hang a shutdown.
+    fn wait_for_idle(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.idle_lock.lock().unwrap();
+        while self.inflight.load(Ordering::SeqCst) > 0 {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            let (g, _) = self.idle.wait_timeout(guard, left).unwrap();
+            guard = g;
+        }
+    }
+}
+
+/// The window's context, or an empty one when the feature is switched off.
+///
+/// Disabling the feature stops *using* the stored history without deleting it,
+/// so switching it back on resumes where the user left off.
+fn load_context(engine: &Engine, cfg: &Config, key: &str) -> WindowContext {
+    if cfg.context_enabled {
+        engine.contexts.snapshot(key, cfg)
+    } else {
+        WindowContext::default()
+    }
+}
+
+/// Summarise the window's history once it has outgrown its budget.
+///
+/// Returns the new note, or `None` when it is not yet time or the call failed — a
+/// failed compaction is not fatal, since the uncompacted history is still valid,
+/// just larger.
+async fn compact_if_needed(
+    engine: &Engine,
+    cfg: &Config,
+    ctx: &WindowContext,
+    pinyin: &str,
+) -> Option<String> {
+    if !ctx.needs_compaction(cfg, pinyin) {
+        return None;
+    }
+    api::compact_context(&engine.client, cfg, ctx).await.ok()
+}
+
+/// The window's context as a request should see it, compacted first if it has
+/// outgrown its budget.
+async fn prepare_context(engine: &Engine, cfg: &Config, key: &str, pinyin: &str) -> WindowContext {
+    let ctx = load_context(engine, cfg, key);
+    let Some(summary) = compact_if_needed(engine, cfg, &ctx, pinyin).await else {
+        return ctx;
+    };
+    engine.contexts.update(key, cfg, |c| {
+        c.apply_summary(summary, cfg.context_keep_recent)
+    });
+    load_context(engine, cfg, key)
+}
+
+/// Fold a completed conversion into the window's context, so the next request in
+/// that window sees what has already been written.
+fn remember(engine: &Engine, cfg: &Config, key: &str, pinyin: &str, completed: &api::Completed) {
+    if !cfg.context_enabled {
+        return;
+    }
+    engine.contexts.update(key, cfg, |c| {
+        c.record(pinyin, &completed.text, completed.usage)
+    });
 }
 
 /// Per-input-context session. Holds the raw pinyin buffer and tracks the single
@@ -157,11 +348,13 @@ impl Engine {
 pub struct Session {
     engine: Arc<Engine>,
     buffer: Mutex<String>,
+    /// Which input window is being typed into — the key the conversation context
+    /// is filed under. Set per document by the frontend, because a single
+    /// text-service instance outlives any one document.
+    context_key: Mutex<String>,
     req_counter: AtomicU64,
-    /// Generation/cancel token for the active request. Bumping it cancels any
-    /// outstanding task (its result is dropped) and wakes the notify.
-    active_gen: Arc<AtomicU64>,
-    cancel: Arc<Notify>,
+    /// Generation/cancel token for the active request, shared with the task.
+    control: Arc<SessionControl>,
     /// LLM conversions of the current input the user can cycle through with
     /// up/down. Shared into the worker task so a completed conversion can record
     /// itself.
@@ -182,14 +375,25 @@ struct Candidates {
 
 impl Session {
     pub fn new(engine: Arc<Engine>) -> Session {
+        let control = Arc::new(SessionControl::new());
+        engine.register_session(&control);
         Session {
             engine,
             buffer: Mutex::new(String::new()),
+            context_key: Mutex::new(String::new()),
             req_counter: AtomicU64::new(0),
-            active_gen: Arc::new(AtomicU64::new(0)),
-            cancel: Arc::new(Notify::new()),
+            control,
             candidates: Arc::new(Mutex::new(Candidates::default())),
         }
+    }
+
+    /// Name the window this session is typing into.
+    ///
+    /// The conversation context is filed under this key, so the model keeps
+    /// seeing the same domain, terminology and style for as long as the user
+    /// stays in one window — and starts clean when they move to another.
+    pub fn set_context_key(&self, key: &str) {
+        *self.context_key.lock().unwrap() = key.to_string();
     }
 
     /// Move to the previous (`direction < 0`) or next (`direction >= 0`) cached
@@ -224,33 +428,13 @@ impl Session {
         self.buffer.lock().unwrap().clone()
     }
 
-    /// Conservative estimate of the chat-context token count for the current
-    /// buffer ([system prompt] + [pinyin]). No tokenizer dependency: ~2 chars per
-    /// token, which over-estimates for ordinary English/pinyin so the budget
-    /// check errs toward flushing a little early rather than overshooting.
-    pub fn context_tokens(&self) -> u32 {
-        let cfg = self.engine.config_snapshot();
-        let chars = cfg.system_prompt.chars().count() + self.buffer.lock().unwrap().chars().count();
-        // ceil(chars / 2) + a little overhead for role/message framing.
-        ((chars as u64).div_ceil(2) + 8).min(u32::MAX as u64) as u32
-    }
-
-    /// True when the current context is at/over the configured `max_context_tokens`
-    /// budget. The frontend should flush (commit) the composition and start a
-    /// fresh session before accepting more input, keeping each request small and
-    /// the cached prefix effective.
-    pub fn context_full(&self) -> bool {
-        self.context_tokens() >= self.engine.config_snapshot().max_context_tokens
-    }
-
     pub fn reset(&self) {
         self.cancel_inflight();
         self.buffer.lock().unwrap().clear();
     }
 
     pub fn cancel_inflight(&self) {
-        self.active_gen.fetch_add(1, Ordering::SeqCst);
-        self.cancel.notify_waiters();
+        self.control.cancel();
     }
 
     /// Spawn an async conversion of the current buffer. `deliver` is invoked
@@ -266,30 +450,40 @@ impl Session {
         }
 
         // Supersede any previous request and claim this generation.
-        let my_gen = self.active_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        self.cancel.notify_waiters();
+        let my_gen = self.control.claim();
 
         let request_id = self.req_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let engine = self.engine.clone();
-        let active_gen = self.active_gen.clone();
-        let cancel = self.cancel.clone();
+        let control = self.control.clone();
         let cfg = engine.config_snapshot();
         let handle = engine.rt.clone();
+        let context_key = self.context_key.lock().unwrap().clone();
 
         let candidates = self.candidates.clone();
+        engine.task_started();
         handle.spawn(async move {
+            let ctx = prepare_context(&engine, &cfg, &context_key, &pinyin).await;
             let result = tokio::select! {
                 biased;
-                _ = cancel.notified() => Err(api::ConvertError::Cancelled),
-                r = api::convert(&engine.client, &cfg, &pinyin, &[]) => r,
+                _ = control.wake.notified() => Err(api::ConvertError::Cancelled),
+                r = api::convert(&engine.client, &cfg, &ctx, &pinyin, &[]) => r,
             };
-            if let Ok(text) = &result {
-                record_candidate(&candidates, &active_gen, my_gen, &pinyin, text, false);
+            if let Ok(completed) = &result {
+                record_candidate(
+                    &candidates,
+                    &control.active_gen,
+                    my_gen,
+                    &pinyin,
+                    &completed.text,
+                    false,
+                );
+                remember(&engine, &cfg, &context_key, &pinyin, completed);
             }
             // The callback is invoked exactly once for every convert() that
             // returned a non-zero id (frontends rely on this to balance the
             // resources tied to `deliver`).
-            deliver(finalize(&active_gen, my_gen, request_id, result));
+            deliver(finalize(&control.active_gen, my_gen, request_id, result));
+            engine.task_finished();
         });
 
         request_id
@@ -354,44 +548,54 @@ impl Session {
             return 0;
         }
 
-        let my_gen = self.active_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        self.cancel.notify_waiters();
+        let my_gen = self.control.claim();
 
         let request_id = self.req_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let engine = self.engine.clone();
-        let active_gen = self.active_gen.clone();
-        let cancel = self.cancel.clone();
+        let control = self.control.clone();
         let candidates = self.candidates.clone();
         let cfg = engine.config_snapshot();
         let handle = engine.rt.clone();
+        let context_key = self.context_key.lock().unwrap().clone();
 
+        engine.task_started();
         handle.spawn(async move {
+            let ctx = prepare_context(&engine, &cfg, &context_key, &pinyin).await;
             let result = if cfg.stream {
-                let active_gen_p = active_gen.clone();
+                let control_p = control.clone();
                 // `move` so the spawned future owns `on_partial` (needs only
                 // Send, not Sync). Drop partials from a superseded generation so
                 // a stale stream can't overwrite a newer request's pre-edit.
                 let on_delta = move |cumulative: &str| {
-                    if active_gen_p.load(Ordering::SeqCst) == my_gen {
+                    if control_p.active_gen.load(Ordering::SeqCst) == my_gen {
                         on_partial(request_id, cumulative);
                     }
                 };
                 tokio::select! {
                     biased;
-                    _ = cancel.notified() => Err(api::ConvertError::Cancelled),
-                    r = api::convert_stream(&engine.client, &cfg, &pinyin, &exclude, on_delta) => r,
+                    _ = control.wake.notified() => Err(api::ConvertError::Cancelled),
+                    r = api::convert_stream(&engine.client, &cfg, &ctx, &pinyin, &exclude, on_delta) => r,
                 }
             } else {
                 tokio::select! {
                     biased;
-                    _ = cancel.notified() => Err(api::ConvertError::Cancelled),
-                    r = api::convert(&engine.client, &cfg, &pinyin, &exclude) => r,
+                    _ = control.wake.notified() => Err(api::ConvertError::Cancelled),
+                    r = api::convert(&engine.client, &cfg, &ctx, &pinyin, &exclude) => r,
                 }
             };
-            if let Ok(text) = &result {
-                record_candidate(&candidates, &active_gen, my_gen, &pinyin, text, append);
+            if let Ok(completed) = &result {
+                record_candidate(
+                    &candidates,
+                    &control.active_gen,
+                    my_gen,
+                    &pinyin,
+                    &completed.text,
+                    append,
+                );
+                remember(&engine, &cfg, &context_key, &pinyin, completed);
             }
-            deliver(finalize(&active_gen, my_gen, request_id, result));
+            deliver(finalize(&control.active_gen, my_gen, request_id, result));
+            engine.task_finished();
         });
 
         request_id

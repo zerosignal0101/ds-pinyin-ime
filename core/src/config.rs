@@ -36,6 +36,23 @@ English and identifiers.\n\
 - Example: \"wo yong python xie daima\" -> \"我用python写代码\".\n\
 - If the input is empty or has no pinyin, return it unchanged.";
 
+/// Instruction for the context-compaction call. The conversion history is folded
+/// into a short "scene" note that then rides in front of every later request.
+///
+/// Same two-stage `<analysis>` / `<summary>` shape the reference compaction
+/// prompts use: the scratchpad raises summary quality but is stripped before the
+/// note is stored, so only the conclusion ever reaches the context.
+pub const DEFAULT_CONTEXT_PROMPT: &str = "\
+上面是中文输入法的转换历史：每一轮是用户键入的无调拼音，以及它被转换成的中文。\
+请把这段历史压缩成一份简短的语境摘要，它会被放在后续每一次转换的最前面——\
+那些请求只能看到你的摘要和最近几轮原文，看不到更早的内容。\n\
+先在 <analysis> 标签中逐条梳理，再在 <summary> 中给出结论。摘要需包含：\n\
+1. 主题与领域：这段文字在谈什么，属于什么专业领域。\n\
+2. 术语表：出现过的专业术语、专有名词、人名、地名、产品名及其固定写法，逐条列出。\n\
+3. 文风：书面还是口语、正式程度、中英混排习惯。\n\
+4. 未完结的线索：最后在写什么，接下来可能写什么。\n\
+只输出结论，不要罗列原文；总长不超过 400 字。";
+
 fn default_base_url() -> String {
     DEFAULT_BASE_URL.to_string()
 }
@@ -57,8 +74,26 @@ fn default_timeout_ms() -> u64 {
 fn default_stream() -> bool {
     true
 }
-fn default_max_context_tokens() -> u32 {
-    1000
+fn default_context_enabled() -> bool {
+    true
+}
+fn default_context_window_tokens() -> u32 {
+    16384
+}
+fn default_context_keep_recent() -> u32 {
+    10
+}
+fn default_context_compact_ratio() -> f32 {
+    0.75
+}
+fn default_context_max_windows() -> u32 {
+    20
+}
+fn default_context_prompt() -> String {
+    DEFAULT_CONTEXT_PROMPT.to_string()
+}
+fn default_queue_max_pending() -> u32 {
+    8
 }
 fn default_reasoning_effort() -> String {
     DEFAULT_REASONING_EFFORT.to_string()
@@ -107,12 +142,37 @@ pub struct Config {
     /// Lower perceived latency; disable for a single final delivery.
     #[serde(default = "default_stream")]
     pub stream: bool,
-    /// Soft cap on the per-request chat-context size (system prompt + pinyin), in
-    /// estimated tokens. When the uncommitted buffer would push a request past
-    /// this, the frontend flushes (commits) and starts a fresh session so each
-    /// request stays small and cache-friendly. See `Session::context_full`.
-    #[serde(default = "default_max_context_tokens")]
-    pub max_context_tokens: u32,
+    // ---- Conversation context -------------------------------------------------
+    /// Carry a per-window typing history into every request, so the model sees
+    /// the domain, terminology and style of what is being written. Off makes
+    /// every request the bare `[system, user]` pair it always was.
+    #[serde(default = "default_context_enabled")]
+    pub context_enabled: bool,
+    /// Token budget for that history. The history grows append-only until it
+    /// reaches `context_window_tokens × context_compact_ratio`, where it is
+    /// summarised. Once full this is the steady-state size of every request's
+    /// prompt — so it trades context quality against per-request cost.
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: u32,
+    /// Turns kept verbatim after a compaction. The most recent turns are the
+    /// ones that matter while typing, so summarising *everything* would hurt.
+    #[serde(default = "default_context_keep_recent")]
+    pub context_keep_recent: u32,
+    /// Fraction of `context_window_tokens` at which compaction fires.
+    #[serde(default = "default_context_compact_ratio")]
+    pub context_compact_ratio: f32,
+    /// Upper bound on remembered windows (LRU). Each window keeps its own
+    /// persisted context file.
+    #[serde(default = "default_context_max_windows")]
+    pub context_max_windows: u32,
+    /// Prompt for the compaction call. See [`DEFAULT_CONTEXT_PROMPT`].
+    #[serde(default = "default_context_prompt")]
+    pub context_prompt: String,
+    // ---- Frontend queue -------------------------------------------------------
+    /// How many conversions a frontend may have queued before it stops accepting
+    /// more (back-pressure). Read by the frontends; the core never queues.
+    #[serde(default = "default_queue_max_pending")]
+    pub queue_max_pending: u32,
 }
 
 impl Default for Config {
@@ -128,15 +188,20 @@ impl Default for Config {
             thinking: String::new(),
             timeout_ms: default_timeout_ms(),
             stream: default_stream(),
-            max_context_tokens: default_max_context_tokens(),
+            context_enabled: default_context_enabled(),
+            context_window_tokens: default_context_window_tokens(),
+            context_keep_recent: default_context_keep_recent(),
+            context_compact_ratio: default_context_compact_ratio(),
+            context_max_windows: default_context_max_windows(),
+            context_prompt: default_context_prompt(),
+            queue_max_pending: default_queue_max_pending(),
         }
     }
 }
 
 impl Config {
-    /// Per-user default config path:
-    /// macOS `~/Library/Application Support/DSInput/config.json`,
-    /// Windows `%APPDATA%/DSInput/config.json`.
+    /// Per-user default config path —
+    /// Windows `%APPDATA%/DSInput/DSInput/config/config.json`.
     pub fn default_path() -> PathBuf {
         if let Some(dirs) = directories::ProjectDirs::from("io", "DSInput", "DSInput") {
             dirs.config_dir().join("config.json")
@@ -192,12 +257,32 @@ mod tests {
     fn missing_fields_fill_from_defaults() {
         // A minimal config (only api_key) must still deserialize, with every
         // other field taking its default — this is what a fresh Settings save
-        // or a hand-edited file may look like.
+        // or a hand-edited file may look like. A config file written before the
+        // context fields existed lands here too, and must not fail to load.
         let json = r#"{ "api_key": "sk-test" }"#;
         let c: Config = serde_json::from_str(json).unwrap();
         assert_eq!(c.api_key, "sk-test");
         assert_eq!(c.model, "deepseek-v4-flash");
         assert_eq!(c.temperature, 0.3);
+        assert!(c.context_enabled);
+    }
+
+    #[test]
+    fn context_defaults_leave_compaction_headroom() {
+        let c = Config::default();
+        assert_eq!(c.context_window_tokens, 16384);
+        assert_eq!(c.context_keep_recent, 10);
+        assert_eq!(c.context_compact_ratio, 0.75);
+        assert!(c.context_max_windows > 0);
+        assert!(c.queue_max_pending > 0);
+        assert!(!c.context_prompt.is_empty());
+        // Compaction has to fire strictly before the window is full, otherwise
+        // the summarising request itself would be built from an over-budget
+        // history.
+        assert!(
+            c.context_compact_ratio > 0.0 && c.context_compact_ratio < 1.0,
+            "compaction ratio must leave headroom"
+        );
     }
 
     #[test]
