@@ -8,8 +8,8 @@
 //     stand up the hidden message-only window used for cross-thread marshaling.
 //   * ITfThreadMgrEventSink + ITfThreadFocusSink stubs (we mostly care about
 //     focus to drop a stale composition cleanly).
-//   * The hidden window proc that receives WM_DSIME_CONVERT_RESULT from the core
-//     worker thread and WM_DSIME_DEBOUNCE_FIRE from the timer.
+//   * The hidden window proc that receives the streamed partials and the
+//     terminal WM_DSIME_CONVERT_RESULT from the core worker thread.
 
 #include "TextService.h"
 #include "Globals.h"
@@ -123,7 +123,6 @@ fail:
 
 STDMETHODIMP CTextService::Deactivate() {
     // Tear down in reverse order of Activate. Each helper is idempotent.
-    _CancelDebounce();
     _UninitLanguageBar();
     _UninitKeyEventSink();
     _UninitThreadFocusSink();
@@ -177,7 +176,6 @@ STDMETHODIMP CTextService::OnSetFocus(ITfDocumentMgr* /*pdimFocus*/,
     // the old document here (it may be gone); TSF terminates the composition
     // and OnCompositionTerminated fires to release our reference.
     if (_HasComposition()) {
-        _CancelDebounce();
         _session.Cancel();
         _ResetBuffer();
     }
@@ -190,7 +188,6 @@ STDMETHODIMP CTextService::OnSetThreadFocus()  { return S_OK; }
 STDMETHODIMP CTextService::OnKillThreadFocus() {
     // Whole thread lost focus (app switch). Drop any in-flight conversion so a
     // late result doesn't pop into a background window.
-    _CancelDebounce();
     _session.Cancel();
     return S_OK;
 }
@@ -202,7 +199,6 @@ STDMETHODIMP CTextService::OnCompositionTerminated(TfEditCookie /*ecWrite*/,
     // TSF (or the app) ended our composition out from under us. Release our
     // reference and reset state; do NOT issue further edits on this range.
     if (_pComposition == pComposition) {
-        _CancelDebounce();
         _session.Cancel();
         if (_pComposition) {
             _pComposition->Release();
@@ -339,7 +335,8 @@ LRESULT CALLBACK CTextService::_MsgWndProc(HWND hWnd, UINT msg,
             CTextService* self =
                 reinterpret_cast<CTextService*>(::GetWindowLongPtrW(hWnd, GWLP_USERDATA));
             if (self) {
-                self->_OnConvertResultOnStaThread(r->request_id, r->status, r->text);
+                self->_OnConvertResultOnStaThread(r->request_id, r->status, r->text,
+                                                  true /*is_final*/);
             }
             // We hold a ref that was taken when the request was issued; release
             // it now that the round trip is complete.
@@ -356,16 +353,11 @@ LRESULT CALLBACK CTextService::_MsgWndProc(HWND hWnd, UINT msg,
             CTextService* self =
                 reinterpret_cast<CTextService*>(::GetWindowLongPtrW(hWnd, GWLP_USERDATA));
             if (self) {
-                self->_OnConvertResultOnStaThread(r->request_id, r->status, r->text);
+                self->_OnConvertResultOnStaThread(r->request_id, r->status, r->text,
+                                                  false /*is_final*/);
             }
             delete r;  // no ref to release for partials
         }
-        return 0;
-    }
-    if (msg == WM_DSIME_DEBOUNCE_FIRE) {
-        CTextService* self =
-            reinterpret_cast<CTextService*>(::GetWindowLongPtrW(hWnd, GWLP_USERDATA));
-        if (self) self->_FireConversion();
         return 0;
     }
     return ::DefWindowProcW(hWnd, msg, wParam, lParam);

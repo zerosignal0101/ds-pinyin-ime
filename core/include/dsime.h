@@ -87,17 +87,6 @@ int32_t   ds_engine_set_config_json(DsEngine *engine, const char *json_utf8);
 /* The configured config file path (caller frees). */
 char     *ds_engine_config_path(DsEngine *engine);
 
-/* Teach the local speculative n-gram model that `pinyin_ascii` converts to
- * `hanzi_utf8` (e.g. text the user just committed), so future input can be
- * guessed locally. The model is also trained automatically from each successful
- * conversion, so calling this is optional. No-op when speculation is disabled or
- * the pair does not align one-to-one (mixed/English input, length mismatch). The
- * model persists to `ngram.json` beside the config file. Returns DS_OK, or
- * DS_ERR_CONFIG if an argument is NULL or not valid UTF-8. */
-int32_t   ds_engine_learn(DsEngine *engine,
-                          const char *pinyin_ascii,
-                          const char *hanzi_utf8);
-
 /* ---- Session lifecycle --------------------------------------------------- */
 
 DsSession *ds_session_new(DsEngine *engine);
@@ -108,18 +97,6 @@ void       ds_session_set_input(DsSession *session, const char *pinyin_ascii);
 
 /* The current raw pinyin buffer (caller frees). Never NULL. */
 char      *ds_session_get_input(DsSession *session);
-
-/* Instant local SPECULATIVE conversion of the current buffer (caller frees,
- * never NULL). Returns the local n-gram model's best guess so the frontend can
- * paint a pre-edit immediately — before, and while, the async
- * ds_session_convert[_stream] request runs — the remote result then supersedes
- * it. Returns an empty string when speculation is disabled (config `speculative`
- * = false) or the model can't fully cover the input. Synchronous and cheap; safe
- * to call on every keystroke. The model ships PRETRAINED on a high-frequency
- * vocabulary, so it speculates common phrases on first launch; it is then
- * trained further, automatically, from each successful remote conversion (and
- * via ds_engine_learn). */
-char      *ds_session_speculate(DsSession *session);
 
 /* Kick off async conversion of the current buffer. Cancels any previous
  * in-flight request for this session. Returns a monotonic request id, or 0 if
@@ -147,9 +124,8 @@ uint64_t   ds_session_convert_stream(DsSession *session,
                                      void *user_data);
 
 /* ---- Candidate cycling (up/down) ---------------------------------------- */
-/* The remote (LLM) conversion is always authoritative — it supersedes the local
- * n-gram speculation. After it lands, the user can cycle through alternative LLM
- * conversions of the SAME input with up/down. */
+/* The LLM conversion is authoritative. After it lands, the user can cycle
+ * through alternative LLM conversions of the SAME input with up/down. */
 
 /* Move to another already-fetched candidate for the current buffer and return it
  * (caller frees, never NULL). direction > 0 -> NEXT candidate; direction < 0 ->
@@ -183,10 +159,6 @@ void       ds_session_reset(DsSession *session);
 int32_t    ds_session_context_full(DsSession *session);
 
 /* ---- Utilities ----------------------------------------------------------- */
-
-/* The configured idle debounce in milliseconds the frontend should wait after
- * the last keystroke before calling ds_session_convert. */
-uint32_t   ds_engine_debounce_ms(DsEngine *engine);
 
 void        ds_string_free(char *s);
 const char *ds_last_error(void); /* thread-local last error, never NULL */

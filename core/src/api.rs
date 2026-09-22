@@ -42,6 +42,7 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     /// gpt-5 / o-series reject any non-default temperature, so we omit it for them.
+    /// Providers that use a thinking mode also ignore it while thinking is on.
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     /// Classic OpenAI-compatible token cap (DeepSeek et al.).
@@ -50,7 +51,21 @@ struct ChatRequest<'a> {
     /// gpt-5 / o-series replacement for `max_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    /// DeepSeek-style thinking switch (`{"thinking":{"type":"enabled"}}`).
+    /// Omitted unless the config explicitly sets `thinking`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingRequest<'a>>,
+    /// Reasoning-effort hint; omitted when the config leaves it empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     stream: bool,
+}
+
+/// The `{"type": …}` body of the `thinking` request field.
+#[derive(Serialize)]
+struct ThinkingRequest<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
 }
 
 #[derive(Serialize)]
@@ -184,12 +199,38 @@ fn token_params(cfg: &Config, exclude: &[String]) -> (Option<f32>, Option<u32>, 
         // configured (lower) value errors, so omit it entirely.
         (None, None, Some(cfg.max_tokens))
     } else {
-        (
-            Some(effective_temperature(cfg, exclude)),
-            Some(cfg.max_tokens),
-            None,
-        )
+        // A provider ignores temperature while its thinking mode is on (which is
+        // the default for reasoning models), so only send it when thinking has
+        // been explicitly switched off.
+        let temperature = if thinking_disabled(cfg) {
+            Some(effective_temperature(cfg, exclude))
+        } else {
+            None
+        };
+        (temperature, Some(cfg.max_tokens), None)
     }
+}
+
+/// True when the config explicitly turns the provider's thinking mode off — the
+/// only configuration in which `temperature` is honoured.
+fn thinking_disabled(cfg: &Config) -> bool {
+    cfg.thinking.trim().eq_ignore_ascii_case("disabled")
+}
+
+/// Split the config's thinking knobs into the two request fields. Both are
+/// omitted when unset, so a custom OpenAI-compatible endpoint that rejects them
+/// can be used by leaving the settings empty.
+fn thinking_params(cfg: &Config) -> (Option<ThinkingRequest<'_>>, Option<&str>) {
+    let kind = match cfg.thinking.trim().to_ascii_lowercase().as_str() {
+        "enabled" => Some("enabled"),
+        "disabled" => Some("disabled"),
+        _ => None,
+    };
+    let effort = match cfg.reasoning_effort.trim() {
+        "" => None,
+        e => Some(e),
+    };
+    (kind.map(|kind| ThinkingRequest { kind }), effort)
 }
 
 /// Send one conversion request. `client` is a shared, connection-pooled client.
@@ -210,12 +251,15 @@ pub async fn convert(
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let regen = regen_instruction(exclude);
     let (temperature, max_tokens, max_completion_tokens) = token_params(cfg, exclude);
+    let (thinking, reasoning_effort) = thinking_params(cfg);
     let body = ChatRequest {
         model: &cfg.model,
         messages: build_messages(cfg, pinyin, &regen),
         temperature,
         max_tokens,
         max_completion_tokens,
+        thinking,
+        reasoning_effort,
         stream: false,
     };
 
@@ -282,12 +326,15 @@ where
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let regen = regen_instruction(exclude);
     let (temperature, max_tokens, max_completion_tokens) = token_params(cfg, exclude);
+    let (thinking, reasoning_effort) = thinking_params(cfg);
     let body = ChatRequest {
         model: &cfg.model,
         messages: build_messages(cfg, pinyin, &regen),
         temperature,
         max_tokens,
         max_completion_tokens,
+        thinking,
+        reasoning_effort,
         stream: true,
     };
 
@@ -424,6 +471,8 @@ mod tests {
         let base = Config {
             max_tokens: 256,
             temperature: 0.3,
+            // Temperature is only honoured with thinking switched off.
+            thinking: "disabled".to_string(),
             ..Config::default()
         };
 
@@ -456,11 +505,85 @@ mod tests {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: Some(256),
+            thinking: None,
+            reasoning_effort: None,
             stream: false,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("max_completion_tokens"));
         assert!(!json.contains("\"temperature\""));
         assert!(!json.contains("\"max_tokens\""));
+    }
+
+    #[test]
+    fn temperature_is_omitted_while_thinking_is_on() {
+        // A provider ignores temperature while its thinking mode is on, and that
+        // mode is on by default — so no temperature may be sent.
+        let cfg = Config {
+            model: "deepseek-v4-flash".to_string(),
+            temperature: 0.3,
+            ..Config::default() // thinking: ""
+        };
+        assert_eq!(token_params(&cfg, &[]).0, None);
+
+        // Explicitly switching thinking off makes temperature meaningful again.
+        let cfg = Config {
+            thinking: "disabled".to_string(),
+            ..cfg
+        };
+        assert_eq!(token_params(&cfg, &[]).0, Some(0.3));
+    }
+
+    #[test]
+    fn thinking_params_serialize_only_when_configured() {
+        // Defaults: the effort hint is sent, the thinking switch is not.
+        let cfg = Config::default();
+        let (thinking, effort) = thinking_params(&cfg);
+        assert!(thinking.is_none());
+        assert_eq!(effort, Some("low"));
+
+        // An explicit switch is sent; an emptied effort is omitted.
+        let cfg = Config {
+            thinking: "enabled".to_string(),
+            reasoning_effort: String::new(),
+            ..Config::default()
+        };
+        let (thinking, effort) = thinking_params(&cfg);
+        assert_eq!(thinking.map(|t| t.kind), Some("enabled"));
+        assert!(effort.is_none());
+
+        // Case/whitespace tolerant; an unrecognised value omits the field.
+        let cfg = Config {
+            thinking: " DISABLED ".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(thinking_params(&cfg).0.map(|t| t.kind), Some("disabled"));
+
+        let cfg = Config {
+            thinking: "sometimes".to_string(),
+            ..Config::default()
+        };
+        assert!(thinking_params(&cfg).0.is_none());
+    }
+
+    #[test]
+    fn default_request_carries_effort_and_no_temperature() {
+        let cfg = Config::default();
+        let (temperature, max_tokens, max_completion_tokens) = token_params(&cfg, &[]);
+        let (thinking, reasoning_effort) = thinking_params(&cfg);
+        let body = ChatRequest {
+            model: &cfg.model,
+            messages: vec![],
+            temperature,
+            max_tokens,
+            max_completion_tokens,
+            thinking,
+            reasoning_effort,
+            stream: false,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("\"reasoning_effort\":\"low\""), "{json}");
+        assert!(!json.contains("\"temperature\""), "{json}");
+        assert!(!json.contains("\"thinking\""), "{json}");
     }
 }

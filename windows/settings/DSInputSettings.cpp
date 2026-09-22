@@ -159,7 +159,8 @@ void LoadIntoDialog(HWND dlg) {
     SetText(dlg, IDC_TEMPERATURE,   dsime::Utf8ToUtf16(JsonGetNumber(j, "temperature")));
     SetText(dlg, IDC_MAX_TOKENS,    dsime::Utf8ToUtf16(JsonGetNumber(j, "max_tokens")));
     SetText(dlg, IDC_TIMEOUT_MS,    dsime::Utf8ToUtf16(JsonGetNumber(j, "timeout_ms")));
-    SetText(dlg, IDC_DEBOUNCE_MS,   dsime::Utf8ToUtf16(JsonGetNumber(j, "debounce_ms")));
+    SetText(dlg, IDC_REASONING_EFFORT, dsime::Utf8ToUtf16(JsonGetString(j, "reasoning_effort")));
+    SetText(dlg, IDC_THINKING,      dsime::Utf8ToUtf16(JsonGetString(j, "thinking")));
 
     dsime::CoreString path = g_engine.ConfigPath();
     SetText(dlg, IDC_CONFIG_PATH, L"Config: " + path.to_wstring());
@@ -174,13 +175,16 @@ std::string BuildConfigJson(HWND dlg) {
     std::string temp       = dsime::Utf16ToUtf8(GetText(dlg, IDC_TEMPERATURE));
     std::string max_tokens = dsime::Utf16ToUtf8(GetText(dlg, IDC_MAX_TOKENS));
     std::string timeout    = dsime::Utf16ToUtf8(GetText(dlg, IDC_TIMEOUT_MS));
-    std::string debounce   = dsime::Utf16ToUtf8(GetText(dlg, IDC_DEBOUNCE_MS));
+    // Both thinking knobs are strings and may be left empty, which tells the core
+    // to omit the corresponding request field entirely (for endpoints that
+    // reject them) — so they are never defaulted here.
+    std::string reasoning  = dsime::Utf16ToUtf8(GetText(dlg, IDC_REASONING_EFFORT));
+    std::string thinking   = dsime::Utf16ToUtf8(GetText(dlg, IDC_THINKING));
 
     // Default numeric fields if the user blanked them, so the JSON stays valid.
     if (temp.empty())       temp = "0.3";
-    if (max_tokens.empty()) max_tokens = "256";
+    if (max_tokens.empty()) max_tokens = "1024";
     if (timeout.empty())    timeout = "8000";
-    if (debounce.empty())   debounce = "100";
 
     std::string json;
     json += "{\n";
@@ -190,8 +194,9 @@ std::string BuildConfigJson(HWND dlg) {
     json += "  \"system_prompt\": \"" + JsonEscape(prompt)   + "\",\n";
     json += "  \"temperature\": "     + temp       + ",\n";
     json += "  \"max_tokens\": "      + max_tokens + ",\n";
-    json += "  \"timeout_ms\": "      + timeout    + ",\n";
-    json += "  \"debounce_ms\": "     + debounce   + "\n";
+    json += "  \"reasoning_effort\": \"" + JsonEscape(reasoning) + "\",\n";
+    json += "  \"thinking\": \""      + JsonEscape(thinking) + "\",\n";
+    json += "  \"timeout_ms\": "      + timeout    + "\n";
     json += "}\n";
     return json;
 }

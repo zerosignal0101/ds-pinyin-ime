@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
 /// Default model — a fast, cheap chat model well suited to inline conversion.
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+/// Default reasoning effort for the provider's thinking mode, sent as
+/// `reasoning_effort`. Providers default to "high", which is markedly slower on
+/// long input; "low" measured the same accuracy on hard unsegmented pinyin at
+/// roughly half the latency.
+pub const DEFAULT_REASONING_EFFORT: &str = "low";
 
 /// Instruction that turns a chat model into a whole-sentence pinyin converter.
 // Kept byte-stable and sent as the first (system) message on every request so it
@@ -44,13 +49,10 @@ fn default_temperature() -> f32 {
     0.3
 }
 fn default_max_tokens() -> u32 {
-    256
+    1024
 }
 fn default_timeout_ms() -> u64 {
     8000
-}
-fn default_debounce_ms() -> u32 {
-    100
 }
 fn default_stream() -> bool {
     true
@@ -58,11 +60,8 @@ fn default_stream() -> bool {
 fn default_max_context_tokens() -> u32 {
     1000
 }
-fn default_speculative() -> bool {
-    true
-}
-fn default_ngram_order() -> usize {
-    crate::ngram::DEFAULT_ORDER
+fn default_reasoning_effort() -> String {
+    DEFAULT_REASONING_EFFORT.to_string()
 }
 
 /// The full, serializable user configuration.
@@ -80,18 +79,30 @@ pub struct Config {
     /// System prompt that defines the conversion behaviour.
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
-    /// Sampling temperature. Low = more deterministic conversions.
+    /// Sampling temperature. Low = more deterministic conversions. Providers
+    /// ignore this while their thinking mode is on (DeepSeek documents that it
+    /// neither errors nor takes effect).
     #[serde(default = "default_temperature")]
     pub temperature: f32,
-    /// Upper bound on generated tokens for one sentence.
+    /// Upper bound on generated tokens. This budget must also cover the
+    /// provider's *reasoning* tokens: a reasoning model spends it on its chain
+    /// of thought before emitting any answer, and an exhausted budget comes back
+    /// as empty content rather than an error.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Reasoning-effort hint, sent as `reasoning_effort`. DeepSeek maps
+    /// low→low, medium/high→high, max→max. Empty omits the field, for endpoints
+    /// that do not accept it.
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
+    /// Thinking-mode switch, sent as `{"thinking":{"type":"…"}}`. Empty (the
+    /// default) omits the field entirely; "enabled" / "disabled" set it
+    /// explicitly.
+    #[serde(default)]
+    pub thinking: String,
     /// Per-request network timeout.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    /// Idle time after the last keystroke before the frontend should convert.
-    #[serde(default = "default_debounce_ms")]
-    pub debounce_ms: u32,
     /// Stream the conversion (SSE) so the pre-edit fills in token-by-token.
     /// Lower perceived latency; disable for a single final delivery.
     #[serde(default = "default_stream")]
@@ -102,18 +113,6 @@ pub struct Config {
     /// request stays small and cache-friendly. See `Session::context_full`.
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: u32,
-    /// Enable the local n-gram speculative pre-edit: an instant best-guess
-    /// conversion shown while the remote request is in flight, learned from the
-    /// conversions the provider has already returned. The remote result always
-    /// supersedes the guess; this only lowers *perceived* latency. When false,
-    /// no local model is consulted or trained.
-    #[serde(default = "default_speculative")]
-    pub speculative: bool,
-    /// Context order of the speculative n-gram model (1 = unigram, 2 = bigram).
-    /// Only used when first creating the on-disk model; an existing model keeps
-    /// the order it was built with. Clamped to `>= 1`.
-    #[serde(default = "default_ngram_order")]
-    pub ngram_order: usize,
 }
 
 impl Default for Config {
@@ -125,12 +124,11 @@ impl Default for Config {
             system_prompt: default_system_prompt(),
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
+            reasoning_effort: default_reasoning_effort(),
+            thinking: String::new(),
             timeout_ms: default_timeout_ms(),
-            debounce_ms: default_debounce_ms(),
             stream: default_stream(),
             max_context_tokens: default_max_context_tokens(),
-            speculative: default_speculative(),
-            ngram_order: default_ngram_order(),
         }
     }
 }
@@ -187,7 +185,7 @@ mod tests {
         assert_eq!(c.base_url, "https://api.deepseek.com/v1");
         assert_eq!(c.model, "deepseek-v4-flash");
         assert!(c.api_key.is_empty());
-        assert!(c.debounce_ms > 0);
+        assert!(c.max_tokens > 0);
     }
 
     #[test]

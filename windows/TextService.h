@@ -24,16 +24,18 @@
 //        edit session to replace the composition text — guarding on request_id
 //        so a stale/late result for an older buffer is dropped.
 //
-// COMPOSITION LIFECYCLE:
+// COMPOSITION LIFECYCLE (nothing converts while typing — only Space asks the
+// model for anything):
 //   * First pinyin key with no active composition -> _StartComposition: open an
 //     ITfComposition via ITfContextComposition::StartComposition inside an edit
-//     session, then write the raw pinyin and apply the underline display attr.
-//   * Subsequent keys -> _UpdateCompositionText with the new raw pinyin (typing
-//     never blocks; we always show pinyin first), then (re)arm the debounce
-//     timer which eventually calls ds_session_convert.
-//   * Conversion result -> _UpdateCompositionText with the Chinese sentence.
-//   * Space/Enter -> _CommitComposition (write final text, EndComposition).
-//   * Esc -> revert to raw pinyin then end, or cancel.
+//     session, then write the raw buffer and apply the underline display attr.
+//   * Subsequent pinyin / punctuation / Backspace -> _UpdateCompositionText with
+//     the updated raw buffer. No network traffic and no timer.
+//   * Space -> _FireConversion and set _commitOnResult. Partials redraw the
+//     pre-edit as the sentence streams in; the terminal result is written and
+//     the composition ended — convert and commit in one step.
+//   * Enter -> commit the raw buffer verbatim, with no conversion.
+//   * Esc -> discard everything: the pre-edit is cleared and nothing is written.
 //   * TSF may terminate the composition itself (focus loss, app teardown) ->
 //     OnCompositionTerminated clears our state.
 
@@ -49,11 +51,9 @@
 // deliver a finished conversion. lParam owns a heap ConvertResult* and carries
 // the per-request ref taken in _FireConversion (the proc releases it).
 #define WM_DSIME_CONVERT_RESULT  (WM_USER + 0x100)
-// Posted by the debounce timer to fire conversion on the STA thread.
-#define WM_DSIME_DEBOUNCE_FIRE   (WM_USER + 0x101)
 // A streamed PARTIAL update (cumulative text). lParam owns a heap ConvertResult*
 // but does NOT carry the per-request ref — only the terminal RESULT does.
-#define WM_DSIME_CONVERT_PARTIAL (WM_USER + 0x102)
+#define WM_DSIME_CONVERT_PARTIAL (WM_USER + 0x101)
 
 class CTextService final : public ITfTextInputProcessorEx,
                            public ITfThreadMgrEventSink,
@@ -138,14 +138,14 @@ private:
     HRESULT _EndComposition(ITfContext* pic);
     BOOL    _HasComposition() const { return _pComposition != nullptr; }
 
-    // ---- debounce timer (Composition.cpp) ----
-    void _ArmDebounce();
-    void _CancelDebounce();
-    static VOID CALLBACK _DebounceTimerCallback(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_TIMER);
-
     // ---- conversion plumbing (Composition.cpp) ----
-    void _FireConversion();  // STA thread: snapshot buffer + ds_session_convert_stream
+    // STA thread: snapshot the buffer and issue ds_session_convert_stream. Returns
+    // true when a request was actually issued, so its callback is guaranteed.
+    bool _FireConversion();
     void _FireRegenerate();  // STA thread: ask the core for a different candidate
+    // Drop a conversion that Space set running, because the user went back to
+    // editing and its result must not land over the new input.
+    void _AbandonPendingConversion();
     static void _ConvertCallbackThunk(void* user_data, uint64_t request_id,
                                       int32_t status, const char* text_utf8);
     // Streaming thunk (CORE WORKER THREAD): posts partials as WM_DSIME_CONVERT_PARTIAL
@@ -154,7 +154,7 @@ private:
                                      int32_t status, int32_t is_final,
                                      const char* text_utf8);
     void _OnConvertResultOnStaThread(uint64_t request_id, int32_t status,
-                                     const std::wstring& text);
+                                     const std::wstring& text, bool is_final);
 
     // Reset the pinyin buffer + core session after commit / cancel.
     void _ResetBuffer();
@@ -186,9 +186,10 @@ private:
     dsime::Engine  _engine;
     dsime::Session _session;
 
-    // Raw pinyin typed so far (ASCII, lower-case + apostrophe). Source of truth
-    // for what we send to the core; the composition may show either this or the
-    // converted Chinese.
+    // Raw ASCII typed so far: lower-case pinyin letters, the apostrophe syllable
+    // separator, and the punctuation we keep in the buffer (the model renders it
+    // full-width). Source of truth for what we send to the core; the composition
+    // may show either this or the converted Chinese.
     std::string _pinyin;
     // What the composition currently displays (so commit knows what to write
     // when no conversion has arrived yet).
@@ -200,11 +201,15 @@ private:
     // smaller/older id are stale and dropped.
     uint64_t _lastRequestId = 0;
 
+    // TRUE from the moment Space issues a conversion until its terminal result
+    // lands: a request is in flight, and whatever comes back is to be written to
+    // the document rather than merely previewed. Cleared on any terminal
+    // outcome, so a failed conversion leaves the buffer editable and Space can
+    // simply be pressed again to retry.
+    bool _commitOnResult = false;
+
     // Hidden message-only window for cross-thread marshaling; STA-thread-owned.
     HWND _msgWnd = nullptr;
-
-    // Thread-pool debounce timer (single-shot, re-armed on each keystroke).
-    PTP_TIMER _debounceTimer = nullptr;
 };
 
 // Heap payload posted from the worker thread to the STA thread. Owned by the

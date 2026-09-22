@@ -17,9 +17,10 @@
 #define IDC_TEMPERATURE     204
 #define IDC_MAX_TOKENS      205
 #define IDC_TIMEOUT_MS      206
-#define IDC_DEBOUNCE_MS     207
-#define IDC_SYSTEM_PROMPT   208
-#define IDC_CONFIG_PATH     209
-#define IDC_STATUS          210
-#define IDC_SAVE            211   // maps to IDOK in the dialog
-#define IDC_TEST            212   // runs a sample conversion against current fields
+#define IDC_REASONING_EFFORT 207
+#define IDC_THINKING        208
+#define IDC_SYSTEM_PROMPT   209
+#define IDC_CONFIG_PATH     210
+#define IDC_STATUS          211
+#define IDC_SAVE            212   // maps to IDOK in the dialog
+#define IDC_TEST            213   // runs a sample conversion against current fields

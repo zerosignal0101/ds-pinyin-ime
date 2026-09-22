@@ -3,8 +3,7 @@
 
 use crate::api;
 use crate::config::Config;
-use crate::ngram::NgramModel;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -62,19 +61,6 @@ pub struct Engine {
     client: reqwest::Client,
     config: RwLock<Arc<Config>>,
     config_path: PathBuf,
-    /// Local speculative-conversion model, trained from returned conversions and
-    /// persisted to `ngram_path`. Guarded by its own lock so speculation reads
-    /// don't contend with config reads.
-    ngram: RwLock<NgramModel>,
-    ngram_path: PathBuf,
-}
-
-/// The on-disk model lives next to the config file as `ngram.json`.
-fn ngram_path_for(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .map(|p| p.join("ngram.json"))
-        .unwrap_or_else(|| PathBuf::from("ngram.json"))
 }
 
 /// Owns the Tokio [`Runtime`] plus a strong reference to the shared [`Engine`].
@@ -99,11 +85,6 @@ impl EngineHandle {
         let config = Config::load_or_create(&config_path)
             .map_err(|e| format!("failed to load config at {}: {e}", config_path.display()))?;
 
-        let ngram_path = ngram_path_for(&config_path);
-        // Fresh installs start from the embedded pretrained baseline; an existing
-        // on-disk model (the user's accumulated learning) takes precedence.
-        let ngram = NgramModel::load_or_pretrained(&ngram_path, config.ngram_order);
-
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -111,8 +92,8 @@ impl EngineHandle {
             .map_err(|e| format!("failed to start runtime: {e}"))?;
 
         // One shared, connection-pooled client. We keep idle connections warm so
-        // the rapid-fire incremental conversion requests (one per debounce as the
-        // user types) reuse the same TCP+TLS connection instead of reconnecting.
+        // back-to-back conversions (one per committed sentence) reuse the same
+        // TCP+TLS connection instead of reconnecting.
         let client = reqwest::Client::builder()
             .user_agent(concat!("dsime/", env!("CARGO_PKG_VERSION")))
             .tcp_keepalive(Duration::from_secs(60))
@@ -126,8 +107,6 @@ impl EngineHandle {
             client,
             config: RwLock::new(Arc::new(config)),
             config_path,
-            ngram: RwLock::new(ngram),
-            ngram_path,
         });
         Ok(EngineHandle { _rt: rt, engine })
     }
@@ -145,59 +124,12 @@ impl EngineHandle {
 }
 
 impl Engine {
-    /// A speculative local conversion of `pinyin`, or `None` when speculation is
-    /// disabled or the local model cannot fully cover the input. The result is a
-    /// best guess to paint immediately; the remote conversion supersedes it.
-    pub fn speculate(&self, pinyin: &str) -> Option<String> {
-        if !self.config_snapshot().speculative {
-            return None;
-        }
-        let model = self.ngram.read().unwrap();
-        if model.is_empty() {
-            return None;
-        }
-        model.predict(pinyin)
-    }
-
-    /// Teach the local model that `pinyin` converted to `hanzi` (typically the
-    /// sentence the provider just returned). No-op when speculation is disabled
-    /// or the pair does not align (mixed/English input, length mismatch). Best-
-    /// effort persistence: a write failure is ignored since the model is only a
-    /// latency optimization.
-    ///
-    /// Each user-confirmed conversion is trained `USER_LEARN_WEIGHT` times so
-    /// that a single observation overrides any competing seed-corpus bigram after
-    /// just one use — the user's explicit feedback is more reliable than the
-    /// background frequency data.
-    pub fn learn(&self, pinyin: &str, hanzi: &str) {
-        if !self.config_snapshot().speculative {
-            return;
-        }
-        const USER_LEARN_WEIGHT: usize = 5;
-        let learned = {
-            let mut model = self.ngram.write().unwrap();
-            let mut any = false;
-            for _ in 0..USER_LEARN_WEIGHT {
-                any |= model.learn(pinyin, hanzi);
-            }
-            any
-        };
-        if learned {
-            let model = self.ngram.read().unwrap();
-            let _ = model.save(&self.ngram_path);
-        }
-    }
-
     pub fn config_snapshot(&self) -> Arc<Config> {
         self.config.read().unwrap().clone()
     }
 
     pub fn config_path(&self) -> &PathBuf {
         &self.config_path
-    }
-
-    pub fn debounce_ms(&self) -> u32 {
-        self.config_snapshot().debounce_ms
     }
 
     pub fn get_config_json(&self) -> Result<String, String> {
@@ -232,7 +164,7 @@ pub struct Session {
     cancel: Arc<Notify>,
     /// LLM conversions of the current input the user can cycle through with
     /// up/down. Shared into the worker task so a completed conversion can record
-    /// itself. Only ever holds remote (LLM) outputs — never n-gram guesses.
+    /// itself.
     candidates: Arc<Mutex<Candidates>>,
 }
 
@@ -290,14 +222,6 @@ impl Session {
 
     pub fn get_input(&self) -> String {
         self.buffer.lock().unwrap().clone()
-    }
-
-    /// An instant local speculative conversion of the current buffer, or `None`
-    /// when speculation is disabled or the local model cannot cover the input.
-    /// Synchronous and cheap — a frontend can call this the moment the buffer
-    /// changes to show a guess, then let `convert`/`convert_stream` correct it.
-    pub fn speculate(&self) -> Option<String> {
-        self.engine.speculate(&self.get_input())
     }
 
     /// Conservative estimate of the chat-context token count for the current
@@ -359,10 +283,7 @@ impl Session {
                 _ = cancel.notified() => Err(api::ConvertError::Cancelled),
                 r = api::convert(&engine.client, &cfg, &pinyin, &[]) => r,
             };
-            // Train the local speculative model from a successful conversion so
-            // the next identical/overlapping input can be guessed instantly.
             if let Ok(text) = &result {
-                engine.learn(&pinyin, text);
                 record_candidate(&candidates, &active_gen, my_gen, &pinyin, text, false);
             }
             // The callback is invoked exactly once for every convert() that
@@ -387,9 +308,8 @@ impl Session {
         P: Fn(u64, &str) + Send + 'static,
         F: FnOnce(ConvertOutcome) + Send + 'static,
     {
-        // Normal conversion: no exclusions, paint the local speculation first,
-        // and the result replaces the candidate set.
-        self.stream_with(Vec::new(), true, false, on_partial, deliver)
+        // Normal conversion: no exclusions; the result replaces the candidate set.
+        self.stream_with(Vec::new(), false, on_partial, deliver)
     }
 
     /// Ask the provider for a DIFFERENT conversion of the current input, avoiding
@@ -397,8 +317,7 @@ impl Session {
     /// up/down can revisit it without another request). Same streaming contract
     /// as [`convert_stream`](Self::convert_stream). The frontend calls this when
     /// [`cached_candidate`](Self::cached_candidate) returns `None` going down —
-    /// i.e. the user wants another option but none is cached yet. No local
-    /// speculation is painted (this is an alternative, not a first impression).
+    /// i.e. the user wants another option but none is cached yet.
     pub fn regenerate<P, F>(&self, on_partial: P, deliver: F) -> u64
     where
         P: Fn(u64, &str) + Send + 'static,
@@ -413,17 +332,15 @@ impl Session {
                 Vec::new()
             }
         };
-        self.stream_with(exclude, false, true, on_partial, deliver)
+        self.stream_with(exclude, true, on_partial, deliver)
     }
 
     /// Shared driver for `convert_stream` / `regenerate`. `exclude` lists the
-    /// already-shown conversions to avoid; `speculate` paints the local n-gram
-    /// guess as the first partial; `append` adds the result to the candidate list
-    /// (vs. replacing it).
+    /// already-shown conversions to avoid; `append` adds the result to the
+    /// candidate list (vs. replacing it).
     fn stream_with<P, F>(
         &self,
         exclude: Vec<String>,
-        speculate: bool,
         append: bool,
         on_partial: P,
         deliver: F,
@@ -450,16 +367,6 @@ impl Session {
 
         handle.spawn(async move {
             let result = if cfg.stream {
-                // Paint the instant local speculation as the first partial (if
-                // enabled and the model can cover this input), before the network
-                // responds — the streamed remote tokens then overwrite it. Guarded
-                // by the generation check so a stale speculation can't clobber a
-                // newer request's pre-edit.
-                if speculate && active_gen.load(Ordering::SeqCst) == my_gen {
-                    if let Some(guess) = engine.speculate(&pinyin) {
-                        on_partial(request_id, &guess);
-                    }
-                }
                 let active_gen_p = active_gen.clone();
                 // `move` so the spawned future owns `on_partial` (needs only
                 // Send, not Sync). Drop partials from a superseded generation so
@@ -482,7 +389,6 @@ impl Session {
                 }
             };
             if let Ok(text) = &result {
-                engine.learn(&pinyin, text);
                 record_candidate(&candidates, &active_gen, my_gen, &pinyin, text, append);
             }
             deliver(finalize(&active_gen, my_gen, request_id, result));

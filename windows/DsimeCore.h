@@ -121,9 +121,6 @@ public:
     bool valid() const { return e_ != nullptr; }
     DsEngine* raw() const { return e_; }
 
-    // Idle debounce (ms) the frontend should wait after the last keystroke.
-    uint32_t DebounceMs() const { return e_ ? ds_engine_debounce_ms(e_) : 100; }
-
     CoreString GetConfigJson() const {
         return CoreString(e_ ? ds_engine_get_config_json(e_) : nullptr);
     }

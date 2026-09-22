@@ -2,17 +2,12 @@
 
 A native Windows **Text Services Framework (TSF)** text service that turns whole
 pinyin sentences into Chinese using the shared `dsime` core engine (an
-OpenAI-compatible LLM converter). It is the Windows counterpart to the macOS
-InputMethodKit app, in the Weasel/Squirrel split: a thin native frontend over a
-cross-platform Rust core.
+OpenAI-compatible LLM converter) — a thin native frontend over a Rust core.
 
-There is **no candidate window**. You type pinyin, the converted sentence shows
-up inline as the underlined pre-edit, and Space/Enter commits it.
-
-> Built and reviewed on macOS; it **cannot be compiled here**. The sources are
-> complete, idiomatic TSF C++ meant to be built on Windows with VS 2022 + the
-> Windows SDK + the Rust MSVC toolchain. Treat the binaries as unverified until
-> a Windows build + smoke test passes.
+There is **no candidate window**, and nothing converts while you type. The
+pre-edit is the raw pinyin you entered; Space sends the whole buffer to the model
+and writes the returned sentence straight into the document, in one step. Enter
+writes the raw buffer verbatim (no conversion), and Esc discards everything.
 
 ## Prerequisites
 
@@ -86,11 +81,17 @@ Switch to it with the language switcher (Win+Space).
 
 Open the language-bar / system-tray entry for DS Input and choose **Settings…**
 (or run `DSInputSettings.exe` directly). Fields: Base URL, API Key, Model,
-Temperature, Max tokens, Timeout, Debounce, System prompt. The defaults target
-DeepSeek (`https://api.deepseek.com/v1`, `deepseek-v4-flash`) — **set your API
-key** before first use. Settings are written to
-`%APPDATA%\DSInput\config.json`, the same file the text service reads, so there
-is one source of truth.
+Temperature, Max tokens, Reasoning, Thinking, Timeout, System prompt. The
+defaults target DeepSeek (`https://api.deepseek.com/v1`, `deepseek-v4-flash`) —
+**set your API key** before first use. Settings are written to
+`%APPDATA%\DSInput\DSInput\config\config.json`, the same file the text service
+reads, so there is one source of truth.
+
+> **Reasoning** and **Thinking** map to the provider's `reasoning_effort` and
+> `thinking` fields. Leave either blank to omit it from the request, which is
+> what you want for an endpoint that doesn't accept them. Note that `Max tokens`
+> must also cover the model's hidden *reasoning* tokens — a budget that is too
+> small comes back as an empty result, not an error.
 
 ## How it works (design notes)
 
@@ -100,22 +101,28 @@ composition mutation must happen there. The core's conversion callback fires on
 a Tokio worker thread. We bridge them with a hidden **message-only window**
 created on the STA thread:
 
-- The debounce timer (a thread-pool timer) posts `WM_DSIME_DEBOUNCE_FIRE` to
-  that window; the STA thread then calls `ds_session_convert`.
-- The core callback (a static C thunk) packages the result into a heap struct
-  and `PostMessage`s `WM_DSIME_CONVERT_RESULT`. The STA-thread window proc runs
-  an edit session to update the composition.
+- Space is handled on the STA thread, which calls `ds_session_convert_stream`.
+  Nothing else ever contacts the provider.
+- The core callback (a static C thunk) packages each update into a heap struct
+  and `PostMessage`s `WM_DSIME_CONVERT_PARTIAL` (cumulative preview) or the
+  terminal `WM_DSIME_CONVERT_RESULT`. The STA-thread window proc runs an edit
+  session to update the composition.
 - Stale results are dropped by comparing `request_id` against the most recent
   request id. A reference on the text service is held across each in-flight
   request so it can't be destroyed before the result is delivered.
 
 ### Composition lifecycle
-First pinyin key opens an `ITfComposition` (synchronous read/write edit
-session). Each keystroke rewrites the pre-edit to the raw pinyin immediately
-(typing never blocks) and re-arms the debounce. A conversion result rewrites the
-pre-edit to the Chinese sentence (still composing, underlined). Space/Enter
-commits, Esc reverts to raw pinyin, Backspace edits the buffer and re-triggers
-conversion. If TSF terminates the composition itself
+The first pinyin key opens an `ITfComposition` (synchronous read/write edit
+session). Each keystroke — including punctuation, which joins the buffer — just
+rewrites the pre-edit to the raw buffer; there is no timer and no request. Space
+sets `_commitOnResult` and fires the conversion: streamed partials repaint the
+pre-edit as the sentence arrives, and the terminal result is written and the
+composition ended. A failure or empty result clears the flag and leaves the raw
+buffer on screen, so Space can simply be pressed again.
+
+Editing while a conversion is in flight (any letter, or Backspace) cancels it via
+`_AbandonPendingConversion`, so a late result can never land on top of the user's
+correction. If TSF terminates the composition itself
 (`ITfCompositionSink::OnCompositionTerminated`), we drop our state cleanly.
 
 ### Core ownership
@@ -135,7 +142,7 @@ One `DsEngine` per activation (shared, internally synchronized) and one
 | `TextService.h` | The text-service class declaration (all interfaces). |
 | `TextService.cpp` | Lifecycle, IUnknown, sink wiring, marshaling window. |
 | `KeyEventSink.cpp` | `ITfKeyEventSink`: which keys we eat and how we act. |
-| `Composition.cpp` | Composition orchestration, debounce, conversion plumbing. |
+| `Composition.cpp` | Composition orchestration, conversion plumbing. |
 | `EditSessions.cpp` | `ITfEditSession`s (start / set-text / end composition). |
 | `DisplayAttribute.cpp` | Underline display attribute + provider/enumerator. |
 | `LangBarButton.cpp` | `ITfLangBarItemButton` that opens Settings. |

@@ -28,8 +28,10 @@ BEGIN
     LTEXT           "Timeout (ms):",    -1,            10, 100,  70, 10
     EDITTEXT                            IDC_TIMEOUT_MS, 90,  98,  60, 12, ES_AUTOHSCROLL | ES_NUMBER
 
-    LTEXT           "Debounce (ms):",   -1,            10, 118,  70, 10
-    EDITTEXT                            IDC_DEBOUNCE_MS, 90, 116,  60, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Reasoning:",       -1,            10, 118,  70, 10
+    EDITTEXT                            IDC_REASONING_EFFORT, 90, 116,  60, 12, ES_AUTOHSCROLL
+    LTEXT           "Thinking:",        -1,           164, 118,  46, 10
+    EDITTEXT                            IDC_THINKING, 212, 116,  98, 12, ES_AUTOHSCROLL
 
     LTEXT           "System prompt:",   -1,            10, 136,  90, 10
     EDITTEXT                            IDC_SYSTEM_PROMPT, 10, 148, 300, 80,

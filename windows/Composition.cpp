@@ -1,22 +1,22 @@
-// Composition.cpp — composition orchestration, debounce, and conversion plumbing.
+// Composition.cpp — composition orchestration and conversion plumbing.
 //
 // This file ties the STA-thread composition state in CTextService to the edit
 // sessions (EditSessions.cpp) and to the dsime core's async conversion.
 //
 // Flow recap (all on the STA thread except where noted):
 //   _StartComposition       -> opens the ITfComposition (first pinyin key).
-//   _UpdateCompositionText   -> rewrites the pre-edit (pinyin or converted).
+//   _UpdateCompositionText   -> rewrites the pre-edit (raw buffer or converted).
 //   _CommitComposition       -> writes final text and ends composition.
-//   _EndComposition          -> ends composition with no/empty final text.
-//   _ArmDebounce/_CancelDebounce -> thread-pool single-shot timer; on expiry it
-//       PostMessages WM_DSIME_DEBOUNCE_FIRE to the STA thread (the timer runs on
-//       a pool thread, so it must NOT touch TSF directly).
-//   _FireConversion          -> STA thread: snapshot the buffer, AddRef self,
-//       and ds_session_convert with _ConvertCallbackThunk as the C callback.
-//   _ConvertCallbackThunk    -> CORE WORKER THREAD: package the result and
-//       PostMessage WM_DSIME_CONVERT_RESULT back to the STA window.
-//   _OnConvertResultOnStaThread -> STA thread: drop stale ids, else show the
-//       converted sentence in the composition.
+//   _EndComposition          -> clears the pre-edit and ends composition, so
+//       nothing at all is written (the Esc path).
+//   _FireConversion          -> STA thread: Space pressed. Snapshot the buffer,
+//       AddRef self, and ds_session_convert_stream. This is the ONLY thing that
+//       ever calls the provider — there is no keystroke timer.
+//   _StreamCallbackThunk     -> CORE WORKER THREAD: package each update and
+//       PostMessage WM_DSIME_CONVERT_PARTIAL (cumulative preview) or
+//       WM_DSIME_CONVERT_RESULT (terminal) back to the STA window.
+//   _OnConvertResultOnStaThread -> STA thread: drop stale ids, preview partials,
+//       and on the terminal result write the sentence if Space asked for it.
 
 #include "TextService.h"
 #include "Globals.h"
@@ -77,11 +77,12 @@ HRESULT CTextService::_CommitComposition(ITfContext* pic,
 
 HRESULT CTextService::_EndComposition(ITfContext* pic) {
     if (!_HasComposition()) return S_OK;
-    // End with the raw pinyin already shown (no replacement text): pass hasFinal
-    // = FALSE so whatever is in the range stays, then composition ends. For the
-    // Esc path the caller has already left the raw pinyin in the range.
+    // Discard: write empty replacement text so the pre-edit disappears from the
+    // document and nothing is inserted in its place (the Esc path). hasFinal
+    // must be TRUE for that empty text to be applied — FALSE would leave
+    // whatever is currently in the range sitting there.
     HRESULT hr = Dsime_RequestEndComposition(this, pic, _tid, _pComposition,
-                                             std::wstring(), FALSE /*hasFinal*/);
+                                             std::wstring(), TRUE /*hasFinal*/);
     if (_pComposition) { _pComposition->Release(); _pComposition = nullptr; }
     if (_pCompositionContext) {
         _pCompositionContext->Release();
@@ -95,60 +96,16 @@ void CTextService::_ResetBuffer() {
     _displayText.clear();
     _showingConverted = false;
     _lastRequestId = 0;
+    _commitOnResult = false;
     _session.Reset();  // clears core buffer + cancels in-flight
-}
-
-// ---- debounce timer (thread-pool, single-shot) -----------------------------
-
-void CTextService::_ArmDebounce() {
-    // Lazily create the timer object.
-    if (_debounceTimer == nullptr) {
-        _debounceTimer = ::CreateThreadpoolTimer(&CTextService::_DebounceTimerCallback,
-                                                 this, nullptr);
-        if (_debounceTimer == nullptr) {
-            // Fallback: fire conversion immediately if we can't get a timer.
-            _FireConversion();
-            return;
-        }
-    }
-    // Relative due time in 100ns units, negative => relative. debounce_ms from
-    // the engine config (default 100ms).
-    uint32_t ms = _engine.valid() ? _engine.DebounceMs() : 100;
-    ULARGE_INTEGER due;
-    due.QuadPart = static_cast<ULONGLONG>(-(static_cast<LONGLONG>(ms) * 10000LL));
-    FILETIME ft;
-    ft.dwLowDateTime = due.LowPart;
-    ft.dwHighDateTime = due.HighPart;
-    // window length 0, period 0 => single-shot. Re-arming replaces the pending
-    // due time, which is exactly the debounce behaviour we want.
-    ::SetThreadpoolTimer(_debounceTimer, &ft, 0, 0);
-}
-
-void CTextService::_CancelDebounce() {
-    if (_debounceTimer) {
-        // Cancel a pending fire (NULL due time) and wait for any running
-        // callback to finish so it can't post after we tear down.
-        ::SetThreadpoolTimer(_debounceTimer, nullptr, 0, 0);
-        ::WaitForThreadpoolTimerCallbacks(_debounceTimer, TRUE);
-    }
-}
-
-VOID CALLBACK CTextService::_DebounceTimerCallback(PTP_CALLBACK_INSTANCE,
-                                                   PVOID ctx, PTP_TIMER) {
-    // POOL THREAD: must not touch TSF/composition. Marshal to the STA thread by
-    // posting to the hidden window; _FireConversion runs there.
-    CTextService* self = static_cast<CTextService*>(ctx);
-    if (self && self->_msgWnd) {
-        ::PostMessageW(self->_msgWnd, WM_DSIME_DEBOUNCE_FIRE, 0, 0);
-    }
 }
 
 // ---- conversion: issue request (STA thread) --------------------------------
 
-void CTextService::_FireConversion() {
+bool CTextService::_FireConversion() {
     // STA thread. Only convert if we still have a non-empty buffer and an active
-    // composition (the user may have committed/cancelled while the timer ran).
-    if (!_HasComposition() || _pinyin.empty() || !_session.valid()) return;
+    // composition (the user may have committed/cancelled in the meantime).
+    if (!_HasComposition() || _pinyin.empty() || !_session.valid()) return false;
 
     // The core's set_input was already called on each keystroke; ensure the
     // latest buffer is what gets converted.
@@ -160,18 +117,28 @@ void CTextService::_FireConversion() {
     // (is_final=1) stream callback releases it. Partial updates do not.
     AddRef();
 
-    // Stream the conversion so the pre-edit fills in incrementally (lower
-    // perceived latency). Honors the `stream` config flag: when false the core
-    // fires only the single terminal call. Reuses the engine's pooled, keep-alive
-    // connection and DeepSeek's cached system-prompt prefix across keystrokes.
+    // Stream the conversion so the pre-edit fills in as the answer arrives.
+    // Honors the `stream` config flag: when false the core fires only the single
+    // terminal call. Reuses the engine's pooled, keep-alive connection and the
+    // provider's cached system-prompt prefix across sentences.
     uint64_t reqId = _session.ConvertStream(&CTextService::_StreamCallbackThunk, this);
     if (reqId == 0) {
         // Empty buffer per the core (shouldn't happen given the check above):
         // no callback will fire, so release the ref we just took.
         Release();
-        return;
+        return false;
     }
     _lastRequestId = reqId;
+    return true;
+}
+
+void CTextService::_AbandonPendingConversion() {
+    // The user is typing again, so a conversion Space set running must not land
+    // on top of the new input. Cancelling still delivers a terminal
+    // DS_ERR_CANCELLED, which the result handler treats as "keep the buffer".
+    if (!_commitOnResult) return;
+    _commitOnResult = false;
+    _session.Cancel();
 }
 
 // ---- regeneration: ask for a DIFFERENT candidate (STA thread) --------------
@@ -263,7 +230,8 @@ void CTextService::_StreamCallbackThunk(void* user_data, uint64_t request_id,
 // ---- conversion: result handling (STA thread) ------------------------------
 
 void CTextService::_OnConvertResultOnStaThread(uint64_t request_id, int32_t status,
-                                               const std::wstring& text) {
+                                               const std::wstring& text,
+                                               bool is_final) {
     // Drop stale results: a newer request (or a commit/reset that zeroed
     // _lastRequestId) has superseded this one.
     if (request_id != _lastRequestId) return;
@@ -271,15 +239,29 @@ void CTextService::_OnConvertResultOnStaThread(uint64_t request_id, int32_t stat
     // If the composition ended meanwhile, ignore.
     if (!_HasComposition() || _pCompositionContext == nullptr) return;
 
-    if (status == DS_OK && !text.empty()) {
-        // Replace the pre-edit with the converted Chinese sentence. Still
-        // composing (underlined) — commit happens on Space/Enter.
-        _displayText = text;
-        _showingConverted = true;
-        _UpdateCompositionText(_pCompositionContext, _displayText, TRUE);
-    } else {
-        // Error (or empty): keep showing the raw pinyin. Nothing to do because
-        // the composition already displays it; we just don't switch to Chinese.
-        // (Optionally surface ds_last_error in a future status UI.)
+    // A streamed PARTIAL: preview the sentence as it arrives. Only the terminal
+    // call may write to the document, so this never commits.
+    if (!is_final) {
+        if (status == DS_OK && !text.empty()) {
+            _displayText = text;
+            _showingConverted = true;
+            _UpdateCompositionText(_pCompositionContext, _displayText, TRUE);
+        }
+        return;
     }
+
+    // Terminal. Space asked for convert-and-commit, so a success lands straight
+    // in the document in one step.
+    if (status == DS_OK && !text.empty() && _commitOnResult) {
+        _CommitComposition(_pCompositionContext, text);
+        _ResetBuffer();
+        return;
+    }
+
+    // Failure, empty result, or a preview-only request: keep the raw buffer on
+    // screen and drop the pending-commit flag, so the user can edit it or just
+    // press Space again to retry. (Optionally surface ds_last_error in a future
+    // status UI — today a failed conversion is indistinguishable from a slow
+    // one.)
+    _commitOnResult = false;
 }

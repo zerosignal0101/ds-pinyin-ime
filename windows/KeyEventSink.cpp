@@ -5,14 +5,17 @@
 // share _IsKeyEaten for the decision. The real work lives in _HandleKey, which
 // drives the composition (start / update / commit / cancel).
 //
-// Input alphabet (no candidate UI — the whole design): a-z and apostrophe build
-// the pinyin buffer. Conversion is automatic (an idle debounce after the last
-// keystroke). Space does 分词: it inserts a word-boundary space into the pinyin
-// and re-converts; a DOUBLE space (two in a row) confirms/commits — falling back
-// to the raw pinyin if no conversion has landed yet, so text can always be
-// output. Enter commits immediately. Esc reverts/cancels. Backspace edits.
-// Everything else passes through to the app, after committing any pending
-// composition so the pre-edit isn't stranded.
+// Input alphabet (no candidate UI — the whole design): a-z, the apostrophe and
+// the punctuation we keep all build one raw ASCII buffer, shown verbatim as the
+// pre-edit. NOTHING converts while typing — no timer, no network — so what you
+// see is exactly what you typed.
+//
+// Space is the only key that asks the model for anything: it converts the whole
+// buffer and writes the resulting sentence straight into the document, in one
+// step (see _commitOnResult). Enter writes the raw buffer verbatim, with no
+// conversion — the escape hatch for English or identifiers. Esc discards
+// everything without writing a character. Backspace edits the buffer. Any other
+// key passes through to the app untouched.
 
 #include "TextService.h"
 #include "Globals.h"
@@ -86,8 +89,9 @@ BOOL CTextService::_IsKeyEaten(ITfContext* /*pic*/, WPARAM wParam, LPARAM lParam
         case VK_RETURN:
         case VK_ESCAPE:
         case VK_BACK:
-            // Only meaningful while we have something composing. With an empty
-            // buffer, let the app handle Space/Enter/Backspace normally.
+            // Space (convert + commit), Enter (write the raw buffer), Esc
+            // (discard) and Backspace (edit) only act on a live composition; with
+            // an empty buffer they belong to the app.
             return _HasComposition() ? TRUE : FALSE;
         case VK_UP:
         case VK_DOWN:
@@ -100,14 +104,12 @@ BOOL CTextService::_IsKeyEaten(ITfContext* /*pic*/, WPARAM wParam, LPARAM lParam
     }
 
     wchar_t ch = VkToChar(wParam, lParam);
-    if (IsPinyinChar(wParam, ch)) {
-        // We only consume lower-case latin (no Shift) so users can still type
-        // capitals / shifted symbols verbatim into the app if they want. But
-        // once we ARE composing, also eat letters typed with Shift so the
-        // buffer stays coherent; simplest rule: eat any bare a-z / apostrophe.
-        return TRUE;
-    }
-    // Punctuation we remap to full-width (全角) is eaten whenever the IME is on.
+    // Any bare a-z / apostrophe feeds the buffer. Shift is deliberately not
+    // excluded: a capital mid-buffer should extend what is being typed rather
+    // than strand the pre-edit.
+    if (IsPinyinChar(wParam, ch)) return TRUE;
+    // Punctuation is ours too: appended to the buffer while composing, emitted
+    // as its full-width (全角) form when idle.
     if (FullWidthPunct(ch) != 0) return TRUE;
     return FALSE;
 }
@@ -155,60 +157,38 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
                                  BOOL* pfEaten) {
     switch (wParam) {
         case VK_SPACE: {
-            // Space does 分词 (insert a word-boundary space and re-convert); a
-            // DOUBLE space confirms. We detect the second of two consecutive
-            // spaces by a trailing space already sitting in the buffer.
-            if (!_pinyin.empty() && _pinyin.back() == ' ') {
-                // Second consecutive space -> commit. Prefer the converted
-                // sentence; otherwise fall back to the raw pinyin (boundary
-                // spaces trimmed) so text is always output, even with no/slow
-                // conversion.
-                std::wstring committed;
-                if (_showingConverted) {
-                    committed = _displayText;
-                } else {
-                    std::string trimmed = _pinyin;
-                    while (!trimmed.empty() && trimmed.back() == ' ')
-                        trimmed.pop_back();
-                    committed = dsime::Utf8ToUtf16(trimmed);
-                }
-                HRESULT hr = _CommitComposition(pic, committed);
-                _ResetBuffer();
-                return hr;
+            // The one and only conversion trigger. The whole buffer goes to the
+            // model, and the terminal result is written straight into the
+            // document (via _commitOnResult) rather than merely previewed.
+            if (_commitOnResult) {
+                // Already waiting on a result: swallow the repeat instead of
+                // firing a second, redundant request.
+                return S_OK;
             }
-            // First space: append a 分词 boundary and re-arm auto-conversion.
-            // Keep showing the current conversion (if any) until the new result
-            // lands — a trailing boundary space doesn't change the sentence, and
-            // this lets a quick double-space commit the Chinese, not the pinyin.
-            _pinyin.push_back(' ');
-            _session.SetInput(_pinyin);
-            if (!_showingConverted) {
-                _displayText = dsime::Utf8ToUtf16(_pinyin);
-                HRESULT hr = _UpdateCompositionText(pic, _displayText, TRUE);
-                _ArmDebounce();
-                return hr;
+            if (!_HasComposition() || _pinyin.empty()) {
+                *pfEaten = FALSE;
+                return S_OK;
             }
-            _ArmDebounce();
+            _commitOnResult = true;
+            if (!_FireConversion()) _commitOnResult = false;
             return S_OK;
         }
         case VK_RETURN: {
-            // Enter always commits whatever is currently shown: the converted
-            // Chinese if a conversion has landed, else the raw pinyin (so the user
-            // can take the letters verbatim without converting). Then reset.
-            std::wstring committed = _showingConverted ? _displayText
-                                                        : dsime::Utf8ToUtf16(_pinyin);
-            HRESULT hr = _CommitComposition(pic, committed);
+            // Write the raw buffer verbatim — no conversion. The escape hatch for
+            // English words, identifiers, or anything else the model would
+            // otherwise try to turn into Chinese.
+            if (!_HasComposition()) { *pfEaten = FALSE; return S_OK; }
+            _session.Cancel();
+            HRESULT hr = _CommitComposition(pic, dsime::Utf8ToUtf16(_pinyin));
             _ResetBuffer();
             return hr;
         }
         case VK_ESCAPE: {
-            // Revert: drop the conversion and end the composition writing the
-            // raw pinyin (so the user can keep editing/retyping outside the IME)
-            // — or, if you prefer cancel semantics, end with empty text. We end
-            // with the raw pinyin to avoid silently eating the user's keystrokes.
-            _CancelDebounce();
+            // Discard: drop any in-flight request and clear the pre-edit without
+            // writing a single character to the document.
+            if (!_HasComposition()) { *pfEaten = FALSE; return S_OK; }
             _session.Cancel();
-            HRESULT hr = _EndComposition(pic);  // empty -> just tears down range
+            HRESULT hr = _EndComposition(pic);
             _ResetBuffer();
             (void)hr;
             return S_OK;
@@ -231,14 +211,15 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
             return S_OK;
         }
         case VK_BACK: {
-            // Edit the buffer: drop the last pinyin char. If that empties it,
-            // end the composition; otherwise re-show pinyin and re-arm convert.
+            // Edit the buffer: drop the last character. Editing also supersedes a
+            // conversion Space set running, so a pending result can never be
+            // committed over the user's correction.
+            _AbandonPendingConversion();
             if (!_pinyin.empty()) {
                 _pinyin.pop_back();
             }
             if (_pinyin.empty()) {
                 _session.Cancel();
-                _CancelDebounce();
                 HRESULT hr = _EndComposition(pic);
                 _ResetBuffer();
                 (void)hr;
@@ -247,59 +228,45 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
             _session.SetInput(_pinyin);
             _showingConverted = false;
             _displayText = dsime::Utf8ToUtf16(_pinyin);
-            HRESULT hr = _UpdateCompositionText(pic, _displayText, TRUE);
-            _ArmDebounce();  // re-convert after the edit
-            return hr;
+            return _UpdateCompositionText(pic, _displayText, TRUE);
         }
         default: {
             wchar_t ch = VkToChar(wParam, lParam);
 
-            // Full-width punctuation (全角): a punctuation key commits whatever is
-            // composing (with the symbol appended), or inserts the symbol on its
-            // own when idle. The conversion is deterministic and local.
-            if (wchar_t full = FullWidthPunct(ch)) {
-                std::wstring tail(1, full);
-                if (_HasComposition()) {
-                    std::string py = _pinyin;
-                    while (!py.empty() && py.back() == ' ') py.pop_back();
-                    std::wstring base = _showingConverted ? _displayText
-                                                          : dsime::Utf8ToUtf16(py);
-                    HRESULT hr = _CommitComposition(pic, base + tail);
+            // Idle + punctuation: there is no buffer to add it to, so emit the
+            // full-width (全角) symbol directly.
+            if (!_HasComposition()) {
+                if (wchar_t full = FullWidthPunct(ch)) {
+                    std::wstring tail(1, full);
+                    HRESULT hr = _StartComposition(pic);
+                    if (FAILED(hr)) { *pfEaten = FALSE; return hr; }
+                    hr = _CommitComposition(pic, tail);
                     _ResetBuffer();
                     return hr;
                 }
-                HRESULT hr = _StartComposition(pic);
-                if (FAILED(hr)) { *pfEaten = FALSE; return hr; }
-                hr = _CommitComposition(pic, tail);
-                _ResetBuffer();
-                return hr;
             }
 
-            // A pinyin-building character. Append the produced char (lower-cased
-            // letter or apostrophe) to the buffer.
+            // Map the produced character to its ASCII form for the buffer.
+            // Punctuation is stored as ASCII — the model renders it full-width
+            // together with the sentence.
             char ascii = 0;
-            if (ch >= L'A' && ch <= L'Z') ascii = static_cast<char>(ch - L'A' + 'a');
-            else if (ch >= L'a' && ch <= L'z') ascii = static_cast<char>(ch);
-            else if (ch == L'\'') ascii = '\'';
-            else {
+            if (ch >= L'A' && ch <= L'Z') {
+                ascii = static_cast<char>(ch - L'A' + 'a');
+            } else if (ch >= L'a' && ch <= L'z') {
+                ascii = static_cast<char>(ch);
+            } else if (ch == L'\'') {
+                ascii = '\'';
+            } else if (ch > 0 && ch < 0x80 && FullWidthPunct(ch) != 0) {
+                ascii = static_cast<char>(ch);
+            } else if (wParam >= 'A' && wParam <= 'Z') {
                 // Defensive: VK said letter but ToUnicode didn't agree. Derive
                 // from VK directly.
-                if (wParam >= 'A' && wParam <= 'Z')
-                    ascii = static_cast<char>(wParam - 'A' + 'a');
+                ascii = static_cast<char>(wParam - 'A' + 'a');
             }
             if (ascii == 0) { *pfEaten = FALSE; return S_OK; }
 
-            // Context cap: if the uncommitted buffer is already at the token
-            // budget, flush it (commit the current Chinese, else the raw pinyin)
-            // and start a fresh composition so the next request stays small. The
-            // char being typed begins the new buffer.
-            if (_HasComposition() && _session.ContextFull()) {
-                std::wstring committed = _showingConverted
-                                             ? _displayText
-                                             : dsime::Utf8ToUtf16(_pinyin);
-                _CommitComposition(pic, committed);
-                _ResetBuffer();
-            }
+            // Typing again supersedes a conversion Space set running.
+            _AbandonPendingConversion();
 
             if (!_HasComposition()) {
                 HRESULT hr = _StartComposition(pic);
@@ -308,13 +275,11 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
             _pinyin.push_back(ascii);
             _session.SetInput(_pinyin);
 
-            // Show the raw pinyin immediately so typing never blocks on the
-            // network; the auto-conversion replaces it when it arrives.
+            // Show the raw buffer verbatim. Nothing converts here: the pre-edit
+            // stays exactly what was typed until Space is pressed.
             _showingConverted = false;
             _displayText = dsime::Utf8ToUtf16(_pinyin);
-            HRESULT hr = _UpdateCompositionText(pic, _displayText, TRUE);
-            _ArmDebounce();
-            return hr;
+            return _UpdateCompositionText(pic, _displayText, TRUE);
         }
     }
 }
