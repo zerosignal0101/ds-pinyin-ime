@@ -17,7 +17,7 @@ bool TraceEnabled() {
         wchar_t path[MAX_PATH] = {};
         const DWORD n = ::GetTempPathW(ARRAYSIZE(path), path);
         if (n == 0 || n >= ARRAYSIZE(path) - 16) return false;
-        ::wcscat_s(path, L"dsinput-trace.on");
+        ::wcscat_s(path, L"dspinyinime-trace.on");
         return ::GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
     }();
     return on;
@@ -51,7 +51,7 @@ void DsimeTrace(const wchar_t* fmt, ...) {
     wchar_t path[MAX_PATH] = {};
     const DWORD pn = ::GetTempPathW(ARRAYSIZE(path), path);
     if (pn == 0 || pn >= ARRAYSIZE(path) - 16) return;
-    ::wcscat_s(path, L"dsinput-trace.log");
+    ::wcscat_s(path, L"dspinyinime-trace.log");
 
     // UTF-8 appended as binary. Opening with "ccs=UTF-8" instead would re-emit a
     // BOM on every append, turning the log into a field of U+FEFF.

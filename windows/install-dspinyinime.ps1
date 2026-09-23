@@ -9,7 +9,7 @@
 #   3. Add the TIP id to the user's zh language list so it is selectable with
 #      Win+Space after the next sign-in.
 #
-# Must run ELEVATED. Run:  ./windows/install-dsinput.ps1
+# Must run ELEVATED. Run:  ./windows/install-dspinyinime.ps1
 
 [CmdletBinding()]
 param(
@@ -25,7 +25,7 @@ $elevated = ([Security.Principal.WindowsPrincipal] `
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $elevated) { throw "This script must be run elevated (as Administrator)." }
 
-$log = Join-Path $env:TEMP "dsinput-install.log"
+$log = Join-Path $env:TEMP "dspinyinime-install.log"
 "== DS Pinyin IME install log ==" | Set-Content -Path $log
 function Log($m) { $m | Tee-Object -FilePath $log -Append | Out-Null; Write-Host $m }
 

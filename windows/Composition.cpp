@@ -38,7 +38,7 @@
 
 // ---- the failure log -------------------------------------------------------
 
-// One line to %TEMP%\dsinput-error.log. The file is empty unless something went
+// One line to %TEMP%\dspinyinime-error.log. The file is empty unless something went
 // wrong, so it is safe to leave in a shipping build and it is the first thing to
 // ask a user for — it is also the only record that survives a conversion that
 // never produced text, which otherwise leaves no evidence at all.
@@ -52,7 +52,7 @@ static void AppendErrorLog(const wchar_t* fmt, ...) {
     wchar_t path[MAX_PATH] = {};
     DWORD n = ::GetTempPathW(ARRAYSIZE(path), path);
     if (n == 0 || n >= ARRAYSIZE(path) - 20) return;
-    ::wcscat_s(path, L"dsinput-error.log");
+    ::wcscat_s(path, L"dspinyinime-error.log");
 
     FILE* f = nullptr;
     if (::_wfopen_s(&f, path, L"a, ccs=UTF-8") != 0 || f == nullptr) return;

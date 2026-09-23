@@ -8,7 +8,7 @@
 // per edit session so a single reproduction answers the question instead of
 // prompting another guess.
 //
-// Enabled by the *existence* of %TEMP%\dsinput-trace.on — a marker file rather
+// Enabled by the *existence* of %TEMP%\dspinyinime-trace.on — a marker file rather
 // than an environment variable, because the interesting processes (explorer, a
 // browser, an editor) are long-lived and cannot be relaunched with a new
 // environment on a whim. Drop the marker, reproduce, read the log.
