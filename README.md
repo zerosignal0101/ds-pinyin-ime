@@ -160,5 +160,5 @@ MIT.
 
 ---
 
-友链 / Friend link: [**linux.do**](https://linux.do) — a Chinese-language community
+Friend link: [**linux.do**](https://linux.do) — a Chinese-language community
 for developers.
