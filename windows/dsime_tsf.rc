@@ -5,8 +5,8 @@
 IDI_DSIME ICON "dsime.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,3,0,0
- PRODUCTVERSION 0,3,0,0
+ FILEVERSION 0,4,0,0
+ PRODUCTVERSION 0,4,0,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_DLL
 BEGIN
@@ -16,11 +16,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "DS Pinyin IME"
             VALUE "FileDescription",  "DS Pinyin IME TSF text service"
-            VALUE "FileVersion",      "0.3.0.0"
+            VALUE "FileVersion",      "0.4.0.0"
             VALUE "InternalName",     "dsime_tsf"
             VALUE "OriginalFilename", "dsime_tsf.dll"
             VALUE "ProductName",      "DS Pinyin IME"
-            VALUE "ProductVersion",   "0.3.0.0"
+            VALUE "ProductVersion",   "0.4.0.0"
         END
     END
     BLOCK "VarFileInfo"
