@@ -57,7 +57,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: windows/installer/build/DSInputInstaller.exe
+          path: windows/installer/build/DSPinyinIMEInstaller.exe
           if-no-files-found: error
 
   release:
@@ -74,16 +74,16 @@ jobs:
       - name: Stage release assets
         run: |
           mkdir -p out
-          cp "artifacts/windows-installer/DSInputInstaller.exe" \
-             "out/DSInputInstaller-${GITHUB_REF_NAME}-windows-x64-arm64.exe"
+          cp "artifacts/windows-installer/DSPinyinIMEInstaller.exe" \
+             "out/DSPinyinIMEInstaller-${GITHUB_REF_NAME}-windows-x64-arm64.exe"
       - uses: softprops/action-gh-release@v2
         with:
           files: out/*
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            ## DS Input ${{ github.ref_name }}
+            ## DS Pinyin IME ${{ github.ref_name }}
 
             | Platform | Asset | Notes |
             |----------|-------|-------|
-            | Windows (x64 + ARM64) | `DSInputInstaller-${{ github.ref_name }}-windows-x64-arm64.exe` | Universal elevated installer. |
+            | Windows (x64 + ARM64) | `DSPinyinIMEInstaller-${{ github.ref_name }}-windows-x64-arm64.exe` | Universal elevated installer. |

@@ -1,4 +1,4 @@
-// DSInputSettings.rc — the settings dialog template + icon.
+// DSPinyinIMESettings.rc — the settings dialog template + icon.
 #include "../resource.h"
 #include <winres.h>
 
@@ -7,7 +7,7 @@ IDI_DSIME ICON "../dsime.ico"
 // A simple, resizable-free modal dialog. Units are dialog units (DLU).
 IDD_SETTINGS DIALOGEX 0, 0, 320, 374
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "DS Input Settings"
+CAPTION "DS Pinyin IME Settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     LTEXT           "Base URL:",        -1,            10,  10,  70, 10

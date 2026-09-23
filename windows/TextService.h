@@ -1,4 +1,4 @@
-// TextService.h — the DS Input TSF text service.
+// TextService.h — the DS Pinyin IME TSF text service.
 //
 // CTextService is the single COM object that TSF instantiates from our CLSID.
 // It implements, in one class:
@@ -75,7 +75,7 @@
 
 #include "DsimeCore.h"
 
-class DSInputBoxWnd;
+class DSPinyinIMEBoxWnd;
 
 // Window message we post from the core worker thread to the STA thread to
 // deliver a finished conversion. lParam owns a heap ConvertResult* and carries
@@ -423,7 +423,7 @@ private:
     bool _threadFocused = true;
 
     // The floating input box. Created in Activate, destroyed in Deactivate.
-    DSInputBoxWnd* _inputBox = nullptr;
+    DSPinyinIMEBoxWnd* _inputBox = nullptr;
 
     // A layout change asked for a reposition and the message is still in our
     // queue; coalesces a scrolling burst into one probe.

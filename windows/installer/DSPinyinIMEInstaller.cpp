@@ -1,15 +1,15 @@
-// DSInputInstaller.cpp — a guided, macOS-style installer for the DS Input TSF
-// IME. One self-contained, elevated exe that embeds both the x64 and ARM64
+// DSPinyinIMEInstaller.cpp — a guided, macOS-style installer for the DS Pinyin IME
+// TSF text service. One self-contained, elevated exe that embeds both the x64 and ARM64
 // builds, installs the set matching the host, registers the text service, and
 // adds it to the user's language list.
 //
 // Flow (single window): describe → Install → progress → done / failed.
 //
 //   1. Extract the host-arch payload (dsime_tsf.dll, dsime.dll,
-//      DSInputSettings.exe) to %ProgramFiles%\DSInput.
+//      DSPinyinIMESettings.exe) to %ProgramFiles%\DS Pinyin IME.
 //   2. regsvr32 the TSF DLL (the native-arch regsvr32 in System32 matches the
 //      native-arch DLL we install).
-//   3. Add the DS Input profile to the user's zh-Hans language list.
+//   3. Add the DS Pinyin IME profile to the user's zh-Hans language list.
 //   4. Tell the user to sign out / back in (Windows enrolls a freshly registered
 //      text service at the next logon, like macOS does at login).
 
@@ -29,7 +29,7 @@
 
 namespace {
 
-constexpr wchar_t kInstallDirName[] = L"DSInput";
+constexpr wchar_t kInstallDirName[] = L"DS Pinyin IME";
 // TSF profile id for the language list: "0804:{CLSID}{PROFILE}" — must match
 // windows/Guids.h (c_clsidDsimeTextService / c_guidDsimeProfile) and LANGID 0804.
 constexpr wchar_t kTipId[] =
@@ -133,7 +133,7 @@ bool WriteAllBytes(const std::wstring& path, const std::string& bytes) {
     return ok && wrote == bytes.size();
 }
 
-// Add the DS Input profile to the current user's zh-Hans language list via a
+// Add the DS Pinyin IME profile to the current user's zh-Hans language list via a
 // short PowerShell script (the supported, forward-compatible API). Best-effort.
 void AddToLanguageList(HWND dlg) {
     wchar_t tmp[MAX_PATH]; ::GetTempPathW(MAX_PATH, tmp);
@@ -147,7 +147,7 @@ void AddToLanguageList(HWND dlg) {
         "if (-not $zh) { $ll.Add('zh-Hans-CN'); $zh = $ll | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1 }\r\n"
         "if (-not ($zh.InputMethodTips -contains $tip)) { $zh.InputMethodTips.Add($tip); Set-WinUserLanguageList $ll -Force }\r\n";
     if (!WriteAllBytes(ps, script)) return;
-    PostProgress(dlg, L"Adding DS Input to your language list…");
+    PostProgress(dlg, L"Adding DS Pinyin IME to your language list…");
     RunWait(L"powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + ps + L"\"");
     ::DeleteFileW(ps.c_str());
 }
@@ -172,7 +172,7 @@ bool RunInstall(HWND dlg, std::wstring& outMsg) {
     bool ok =
         ExtractResource(rCore,     dst + L"\\dsime.dll",          &err) &&
         ExtractResource(rTsf,      dst + L"\\dsime_tsf.dll",      &err) &&
-        ExtractResource(rSettings, dst + L"\\DSInputSettings.exe", &err);
+        ExtractResource(rSettings, dst + L"\\DSPinyinIMESettings.exe", &err);
 
     if (ok) {
         PostProgress(dlg, L"Registering the text service…");
@@ -184,9 +184,9 @@ bool RunInstall(HWND dlg, std::wstring& outMsg) {
     if (ok) {
         AddToLanguageList(dlg);  // best-effort
         outMsg =
-            L"DS Input is installed.\r\n\r\nSign out and back in to finish — Windows "
+            L"DS Pinyin IME is installed.\r\n\r\nSign out and back in to finish — Windows "
             L"enables a newly registered input method at the next logon. Then switch to "
-            L"it with Win+Space and set your API key in DS Input Settings.";
+            L"it with Win+Space and set your API key in DS Pinyin IME Settings.";
         return true;
     }
     outMsg = L"Installation failed: " + err;
@@ -211,7 +211,7 @@ DWORD WINAPI InstallThread(LPVOID param) {
 void SetBodyWelcome(HWND dlg) {
     const bool arm64 = HostIsArm64();
     std::wstring body =
-        L"This installs DS Input for this PC. You type toneless pinyin and an LLM "
+        L"This installs DS Pinyin IME for this PC. You type toneless pinyin and an LLM "
         L"converts the whole sentence to Chinese inline — there is no candidate window.\r\n\r\n"
         L"The installer will:\r\n"
         L"  1.  Copy the ";
@@ -219,9 +219,9 @@ void SetBodyWelcome(HWND dlg) {
     body +=
         L" build into Program Files.\r\n"
         L"  2.  Register the text service with Windows.\r\n"
-        L"  3.  Add DS Input to your Chinese (Simplified) keyboards.\r\n\r\n"
+        L"  3.  Add DS Pinyin IME to your Chinese (Simplified) keyboards.\r\n\r\n"
         L"After it finishes, sign out and back in to activate it, then set your API key "
-        L"in DS Input Settings.";
+        L"in DS Pinyin IME Settings.";
     ::SetDlgItemTextW(dlg, IDC_BODY, body.c_str());
 }
 

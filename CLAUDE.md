@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-DS Input is an LLM whole-sentence pinyin IME for Windows. The user types toneless
+DS Pinyin IME is an LLM whole-sentence pinyin IME for Windows. The user types toneless
 ASCII pinyin (`nihaoshijie, woshiyigechengxuyuan`); an OpenAI-compatible chat
 model converts the *whole sentence* to Chinese (`你好世界，我是一个程序员`).
 **There is no candidate window / no candidate picking.**
@@ -136,10 +136,10 @@ The `windows-frontend` job is `continue-on-error` (WIP), but the core jobs are n
 
 Windows frontend (run on Windows, from a *x64 Native Tools Command Prompt for VS 2022*):
 ```powershell
-cd windows; ./build.ps1          # core dsime.dll + CMake builds dsime_tsf.dll + DSInputSettings.exe
+cd windows; ./build.ps1          # core dsime.dll + CMake builds dsime_tsf.dll + DSPinyinIMESettings.exe
 ```
-`windows/install-dsinput.ps1` (elevated) installs the trio into
-`C:\Program Files\DSInput` and registers the text service — the scripted
+`windows/install-dspinyinime.ps1` (elevated) installs the trio into
+`C:\Program Files\DS Pinyin IME` and registers the text service — the scripted
 equivalent of running the guided installer.
 
 ## Things that bite
@@ -168,7 +168,7 @@ equivalent of running the guided installer.
 - **`reasoning_effort` / `thinking` are provider-specific.** They are config
   fields that default to `low` / empty and are omitted from the request body when
   empty, so other OpenAI-compatible endpoints keep working.
-- **Windows DLL co-location**: `dsime_tsf.dll` and `DSInputSettings.exe` load
+- **Windows DLL co-location**: `dsime_tsf.dll` and `DSPinyinIMESettings.exe` load
   `dsime.dll` at runtime — all three must live in the same folder, and `regsvr32`
   records the exact path it was registered from. The DLL's own directory is only
   searched because regsvr32 / COM use `LOAD_WITH_ALTERED_SEARCH_PATH`; a plain
@@ -225,7 +225,7 @@ equivalent of running the guided installer.
   - **`Config::load_or_create` is not the only way a config is written.**
     `ds_engine_set_config_json` deserializes and saves directly, so the Settings
     dialog's Save bypasses every migration — as does its own copy of each default
-    (`DSInputSettings.cpp`'s blank-field fallbacks). Change a core default and the
+    (`DSPinyinIMESettings.cpp`'s blank-field fallbacks). Change a core default and the
     frontend's copy has to move with it, or blanking that field silently writes
     the old value back into a config that had just been migrated.
 - **Ctrl+Space has two separate ways to go wrong, and they need opposite fixes.**
@@ -290,7 +290,7 @@ equivalent of running the guided installer.
 
 ## Config
 
-Single source of truth: a JSON file at `%APPDATA%\DSInput\DSInput\config\config.json`
+Single source of truth: a JSON file at `%APPDATA%\DSPinyinIME\DSPinyinIME\config\config.json`
 matching `core::config::Config`. The Settings UI reads/writes it *only* through
 `ds_engine_get_config_json` / `ds_engine_set_config_json` — never parse or write
 the file from a frontend. Defaults target DeepSeek

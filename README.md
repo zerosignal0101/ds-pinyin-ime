@@ -1,4 +1,4 @@
-# DS Input — LLM Whole‑Sentence Pinyin IME
+# DS Pinyin IME — LLM Whole‑Sentence Pinyin Input Method
 
 Type a whole sentence in pinyin; an LLM converts it to Chinese. **No candidate
 picking** — the model chooses the best sentence and you press Space to take it.
@@ -100,7 +100,7 @@ Studio).
 ## Configuration
 
 Stored as JSON next to the user's config directory (Windows:
-`%APPDATA%\DSInput\DSInput\config\config.json`), and edited through the Settings
+`%APPDATA%\DSPinyinIME\DSPinyinIME\config\config.json`), and edited through the Settings
 window (single source of truth via `ds_engine_{get,set}_config_json`):
 
 | Field | Default | Meaning |
@@ -132,7 +132,7 @@ window (single source of truth via `ds_engine_{get,set}_config_json`):
 ## Building the Windows frontend
 
 ```powershell
-cd windows; ./build.ps1        # core dsime.dll + CMake builds dsime_tsf.dll + DSInputSettings.exe
+cd windows; ./build.ps1        # core dsime.dll + CMake builds dsime_tsf.dll + DSPinyinIMESettings.exe
 ```
 
 Requires VS 2022 (Desktop C++), a Windows SDK, and the Rust MSVC toolchain.

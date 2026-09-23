@@ -1,4 +1,4 @@
-//! C ABI for the DS Input core engine. See `core/include/dsime.h` for the
+//! C ABI for the DS Pinyin IME core engine. See `core/include/dsime.h` for the
 //! authoritative documented interface. This file is the thin, `unsafe` FFI shell
 //! over the safe `engine` / `api` / `config` modules.
 

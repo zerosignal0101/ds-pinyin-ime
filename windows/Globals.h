@@ -28,12 +28,12 @@ inline void DllAddRef()     { ::InterlockedIncrement(&g_cRefDll); }
 inline void DllRelease()    { ::InterlockedDecrement(&g_cRefDll); }
 
 // Human-readable names shown in the language list / language bar.
-#define DSIME_DESC_W      L"DS Input (LLM Pinyin)"
-#define DSIME_DESC_A       "DS Input (LLM Pinyin)"
+#define DSIME_DESC_W      L"DS Pinyin IME"
+#define DSIME_DESC_A       "DS Pinyin IME"
 
 // Settings executable launched from the language-bar menu. Looked up next to
 // the DLL (same install directory).
-#define DSIME_SETTINGS_EXE L"DSInputSettings.exe"
+#define DSIME_SETTINGS_EXE L"DSPinyinIMESettings.exe"
 
 // Resource ids (see resource.h / dsime_tsf.rc).
 #define IDI_DSIME         101

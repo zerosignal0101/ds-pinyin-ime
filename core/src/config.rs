@@ -195,12 +195,13 @@ pub struct Config {
     /// failed one.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    /// Stream the conversion (SSE) so the pre-edit fills in token-by-token.
-    /// Lower perceived latency; disable for a single final delivery.
+    /// Use the streaming API (SSE) instead of a single response. No frontend
+    /// streams today -- the conversion queue is non-streaming by design -- so the
+    /// CLI and the integration tests are what keep this path exercised.
     #[serde(default = "default_stream")]
     pub stream: bool,
     // ---- Conversation context -------------------------------------------------
-    /// Carry a per-window typing history into every request, so the model sees
+    /// Carry a per-process typing history into every request, so the model sees
     /// the domain, terminology and style of what is being written. Off makes
     /// every request the bare `[system, user]` pair it always was.
     #[serde(default = "default_context_enabled")]
@@ -218,8 +219,9 @@ pub struct Config {
     /// Fraction of `context_window_tokens` at which compaction fires.
     #[serde(default = "default_context_compact_ratio")]
     pub context_compact_ratio: f32,
-    /// Upper bound on remembered windows (LRU). Each window keeps its own
-    /// persisted context file.
+    /// Upper bound on remembered contexts -- an in-memory LRU, one per process.
+    /// Nothing here is persisted; the name is left over from the version that
+    /// kept a JSON file per window.
     #[serde(default = "default_context_max_windows")]
     pub context_max_windows: u32,
     /// Prompt for the compaction call. See [`DEFAULT_CONTEXT_PROMPT`].
@@ -258,9 +260,9 @@ impl Default for Config {
 
 impl Config {
     /// Per-user default config path —
-    /// Windows `%APPDATA%/DSInput/DSInput/config/config.json`.
+    /// Windows `%APPDATA%/DSPinyinIME/DSPinyinIME/config/config.json`.
     pub fn default_path() -> PathBuf {
-        if let Some(dirs) = directories::ProjectDirs::from("io", "DSInput", "DSInput") {
+        if let Some(dirs) = directories::ProjectDirs::from("io", "DSPinyinIME", "DSPinyinIME") {
             dirs.config_dir().join("config.json")
         } else {
             PathBuf::from("config.json")

@@ -1,4 +1,4 @@
-# DS Input — Windows TSF frontend
+# DS Pinyin IME — Windows TSF frontend
 
 A native Windows **Text Services Framework (TSF)** text service that turns whole
 pinyin sentences into Chinese using the shared `dsime` core engine (an
@@ -41,7 +41,7 @@ cd windows
 
 Outputs land in `windows/build/Release/`:
 - `dsime_tsf.dll` — the TSF text service (COM in-proc server).
-- `DSInputSettings.exe` — the settings dialog.
+- `DSPinyinIMESettings.exe` — the settings dialog.
 - `dsime.dll` — the core, staged next to them for local testing.
 
 ### Building without the script
@@ -68,7 +68,7 @@ APIs (`ITfInputProcessorProfiles`, `ITfCategoryMgr`), the language profile
 `GUID_TFCAT_TIP_KEYBOARD`, `..._UIELEMENTENABLED`, `..._SECUREMODE`,
 `..._IMMERSIVESUPPORT`, `..._SYSTRAYSUPPORT`, and `DISPLAYATTRIBUTEPROVIDER`.
 
-> The DLL and `DSInputSettings.exe` load `dsime.dll` at runtime. Keep all three
+> The DLL and `DSPinyinIMESettings.exe` load `dsime.dll` at runtime. Keep all three
 > in the same folder (the build stages `dsime.dll` for you), and register the
 > DLL from its final install location — `regsvr32` records that exact path.
 
@@ -77,19 +77,19 @@ APIs (`ITfInputProcessorProfiles`, `ITfCategoryMgr`), the language profile
 After registering, add it as a keyboard:
 
 **Settings ▸ Time & language ▸ Language & region ▸ Chinese (Simplified) ▸ ⋯ ▸
-Language options ▸ Add a keyboard ▸ “DS Input (LLM Pinyin)”.**
+Language options ▸ Add a keyboard ▸ “DS Pinyin IME”.**
 
 (If Chinese (Simplified) is not installed, add it first under *Add a language*.)
 Switch to it with the language switcher (Win+Space).
 
 ## Configure (API key, model, …)
 
-Open the language-bar / system-tray entry for DS Input and choose **Settings…**
-(or run `DSInputSettings.exe` directly). Fields: Base URL, API Key, Model,
+Open the language-bar / system-tray entry for DS Pinyin IME and choose **Settings…**
+(or run `DSPinyinIMESettings.exe` directly). Fields: Base URL, API Key, Model,
 Temperature, Max tokens, Reasoning, Thinking, Timeout, System prompt. The
 defaults target DeepSeek (`https://api.deepseek.com/v1`, `deepseek-v4-flash`) —
 **set your API key** before first use. Settings are written to
-`%APPDATA%\DSInput\DSInput\config\config.json`, the same file the text service
+`%APPDATA%\DSPinyinIME\DSPinyinIME\config\config.json`, the same file the text service
 reads, so there is one source of truth.
 
 > **Reasoning** and **Thinking** map to the provider's `reasoning_effort` and
@@ -352,7 +352,7 @@ One `DsEngine` per activation (shared, internally synchronized) and one
 | `InputWindow.h` / `.cpp` | The floating input box: painting, placement, DPI. |
 | `LangBarButton.cpp` | `ITfLangBarItemButton` that opens Settings. |
 | `resource.h`, `dsime_tsf.rc`, `dsime.ico` | Icon + version resources. |
-| `settings/` | `DSInputSettings.exe` (Win32 dialog over the core config). |
+| `settings/` | `DSPinyinIMESettings.exe` (Win32 dialog over the core config). |
 | `CMakeLists.txt`, `build.ps1` | Build system. |
 | `dsime_tsf.def` | DLL export list. |
 

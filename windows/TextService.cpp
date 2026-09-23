@@ -20,7 +20,7 @@
 #include <new>
 
 // Class name for the hidden message-only window. Registered lazily.
-static const wchar_t kMsgWndClass[] = L"DSInputMsgWnd";
+static const wchar_t kMsgWndClass[] = L"DSPinyinIMEMsgWnd";
 
 CTextService::CTextService() {
     DllAddRef();  // the module stays loaded while any object is alive
@@ -113,7 +113,7 @@ STDMETHODIMP CTextService::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD 
 
     // 3) The floating input box. Non-fatal: without it the IME still converts,
     //    the user just cannot see what they are typing.
-    _inputBox = DSInputBoxWnd::Create(g_hInst);
+    _inputBox = DSPinyinIMEBoxWnd::Create(g_hInst);
 
     // 4) Follow the caret in hosts that tell us about layout changes. The timer
     //    is the fallback for the ones that do not (and for caret moves that

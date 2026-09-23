@@ -14,12 +14,12 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName",      "DS Input"
-            VALUE "FileDescription",  "DS Input TSF text service"
+            VALUE "CompanyName",      "DS Pinyin IME"
+            VALUE "FileDescription",  "DS Pinyin IME TSF text service"
             VALUE "FileVersion",      "0.3.0.0"
             VALUE "InternalName",     "dsime_tsf"
             VALUE "OriginalFilename", "dsime_tsf.dll"
-            VALUE "ProductName",      "DS Input"
+            VALUE "ProductName",      "DS Pinyin IME"
             VALUE "ProductVersion",   "0.3.0.0"
         END
     END

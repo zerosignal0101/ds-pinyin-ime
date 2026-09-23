@@ -110,8 +110,8 @@ public:
     }
 
     // config_path == nullptr uses the per-user default
-    // (%APPDATA%/DSInput/config.json). Returns false on fatal init error; call
-    // LastError() for a message.
+    // (%APPDATA%/DSPinyinIME/DSPinyinIME/config/config.json). Returns false on
+    // fatal init error; call LastError() for a message.
     bool Create(const char* config_path = nullptr) {
         reset();
         e_ = ds_engine_new(config_path);

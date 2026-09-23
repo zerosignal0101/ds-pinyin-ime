@@ -1,8 +1,8 @@
-# CMakeLists.txt — DS Input Windows TSF text service + settings app.
+# CMakeLists.txt — DS Pinyin IME Windows TSF text service + settings app.
 #
 # Produces two binaries:
 #   dsime_tsf.dll        — the in-proc COM TSF text service (regsvr32 target).
-#   DSInputSettings.exe  — standalone settings dialog launched from the IME menu.
+#   DSPinyinIMESettings.exe  — standalone settings dialog launched from the IME menu.
 #
 # Both link the dsime core (built separately by Cargo as a cdylib). We link the
 # MSVC import library produced alongside dsime.dll. build.ps1 drives the whole
@@ -15,7 +15,7 @@ project(dsime_windows LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR
-        "The DS Input Windows frontend builds only on Windows with MSVC. "
+        "The DS Pinyin IME Windows frontend builds only on Windows with MSVC. "
         "On this host you can edit/review the sources but not compile them.")
 endif()
 
@@ -84,13 +84,13 @@ set_target_properties(dsime_tsf PROPERTIES
     PREFIX "")
 
 # ---- the settings app -----------------------------------------------------
-add_executable(DSInputSettings WIN32
-    settings/DSInputSettings.cpp
-    settings/DSInputSettings.rc
+add_executable(DSPinyinIMESettings WIN32
+    settings/DSPinyinIMESettings.cpp
+    settings/DSPinyinIMESettings.rc
 )
-target_include_directories(DSInputSettings PRIVATE "${DSIME_INCLUDE_DIR}")
-target_link_libraries(DSInputSettings PRIVATE "${DSIME_IMPORT_LIB}" ${DSIME_SYS_LIBS})
-set_target_properties(DSInputSettings PROPERTIES OUTPUT_NAME "DSInputSettings")
+target_include_directories(DSPinyinIMESettings PRIVATE "${DSIME_INCLUDE_DIR}")
+target_link_libraries(DSPinyinIMESettings PRIVATE "${DSIME_IMPORT_LIB}" ${DSIME_SYS_LIBS})
+set_target_properties(DSPinyinIMESettings PROPERTIES OUTPUT_NAME "DSPinyinIMESettings")
 
 # ---- post-build: stage dsime.dll next to our binaries ---------------------
 # The text service and settings exe load dsime.dll at runtime; keep a copy in

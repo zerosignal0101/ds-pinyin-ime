@@ -224,7 +224,7 @@ void CTextService::_UpdateInputBox(bool canProbeCaret) {
     }
     // `_modeFlash` is the exception: Ctrl+Space asked for the box to show the new
     // mode even though there is nothing else to put in it. Mirrors the same test
-    // in DSInputBoxWnd::_ShowOrHide — the two are separate copies on purpose (the
+    // in DSPinyinIMEBoxWnd::_ShowOrHide — the two are separate copies on purpose (the
     // box is presentation and this is the state), but they must agree, and a
     // state added to one without the other shows up as a box that will not go
     // away or a flash that never appears.

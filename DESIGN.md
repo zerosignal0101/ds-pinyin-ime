@@ -1,4 +1,4 @@
-# DS Input — LLM Whole‑Sentence Pinyin Input Method
+# DS Pinyin IME — LLM Whole‑Sentence Pinyin Input Method
 
 ## Goal
 A Windows pinyin input method (IME) that converts a whole pinyin sentence into
@@ -160,7 +160,7 @@ Any OpenAI‑compatible endpoint works (OpenAI, Azure, OpenRouter, local Ollama/
 vLLM/LM Studio) by changing `base_url` + `model` + `api_key`.
 
 ## Config file
-`%APPDATA%\DSInput\DSInput\config\config.json`. Schema = `core::config::Config`.
+`%APPDATA%\DSPinyinIME\DSPinyinIME\config\config.json`. Schema = `core::config::Config`.
 The Settings UI reads/writes it via `ds_engine_get_config_json` /
 `ds_engine_set_config_json` so there is a single source of truth.
 
@@ -172,7 +172,7 @@ it verbatim.
 The conversation contexts are held in memory by the engine, so the config stays a
 settings file rather than a data store. `ds_engine_clear_contexts` is the way to be
 rid of them, and it also deletes the per-window JSON an older version wrote under
-`%APPDATA%\DSInput\DSInput\context\` — nothing reads those any more, and a record
+`%APPDATA%\DSPinyinIME\DSPinyinIME\context\` — nothing reads those any more, and a record
 of the user's typed text should not outlive the feature that made it.
 
 The system prompt has a related trap: it is *stored* in the config file, so editing

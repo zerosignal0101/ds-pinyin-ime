@@ -1,8 +1,8 @@
-# install-dsinput.ps1 — elevated install of the DS Input TSF text service (x64).
+# install-dspinyinime.ps1 — elevated install of the DS Pinyin IME TSF text service (x64).
 #
-# Mirrors what windows/installer/DSInputInstaller.cpp does at runtime:
-#   1. Copy the trio (dsime.dll, dsime_tsf.dll, DSInputSettings.exe) into
-#      %ProgramFiles%\DSInput — all three must co-locate (the DLLs load dsime.dll
+# Mirrors what windows/installer/DSPinyinIMEInstaller.cpp does at runtime:
+#   1. Copy the trio (dsime.dll, dsime_tsf.dll, DSPinyinIMESettings.exe) into
+#      %ProgramFiles%\DS Pinyin IME — all three must co-locate (the DLLs load dsime.dll
 #      at runtime), and regsvr32 records the exact path it registers from.
 #   2. regsvr32 the text service: DllRegisterServer writes HKCR\CLSID
 #      InprocServer32 + the TSF profile/categories for zh-Hans (0x0804).
@@ -15,7 +15,7 @@
 param(
     # Source of the staged build (build.ps1 output).
     [string]$Src = (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "dist\x64"),
-    [string]$Dst = (Join-Path $env:ProgramFiles "DSInput")
+    [string]$Dst = (Join-Path $env:ProgramFiles "DS Pinyin IME")
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,10 +26,10 @@ $elevated = ([Security.Principal.WindowsPrincipal] `
 if (-not $elevated) { throw "This script must be run elevated (as Administrator)." }
 
 $log = Join-Path $env:TEMP "dsinput-install.log"
-"== DS Input install log ==" | Set-Content -Path $log
+"== DS Pinyin IME install log ==" | Set-Content -Path $log
 function Log($m) { $m | Tee-Object -FilePath $log -Append | Out-Null; Write-Host $m }
 
-$files = @("dsime.dll", "dsime_tsf.dll", "DSInputSettings.exe")
+$files = @("dsime.dll", "dsime_tsf.dll", "DSPinyinIMESettings.exe")
 foreach ($f in $files) {
     if (-not (Test-Path (Join-Path $Src $f))) { throw "missing $f under $Src — run build.ps1 first." }
 }
@@ -84,7 +84,7 @@ if ($p.ExitCode -ne 0) { throw "regsvr32 failed (exit $($p.ExitCode))" }
 # ── 3. Add the TIP to the zh language list ──────────────────────────────────
 # "0804:{CLSID}{PROFILE}" — must match windows/Guids.h.
 $tip = '0804:{6F3D9A21-7C44-4E1B-9C2A-1B2C3D4E5F60}{A1B2C3D4-55E6-47F8-8901-23456789ABCD}'
-Log "== Adding DS Input to the Chinese language list"
+Log "== Adding DS Pinyin IME to the Chinese language list"
 $ll = Get-WinUserLanguageList
 $zh = $ll | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
 if (-not $zh) {
@@ -99,4 +99,4 @@ if ($zh.InputMethodTips -notcontains $tip) {
     Log "   already present on '$($zh.LanguageTag)'"
 }
 
-Log "DONE — sign out and back in to activate, then pick DS Input with Win+Space."
+Log "DONE — sign out and back in to activate, then pick DS Pinyin IME with Win+Space."

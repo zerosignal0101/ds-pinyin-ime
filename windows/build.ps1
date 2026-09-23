@@ -1,9 +1,9 @@
-# build.ps1 — build the DS Input Windows frontend for one or more architectures.
+# build.ps1 — build the DS Pinyin IME Windows frontend for one or more architectures.
 #
 # For each requested arch it:
 #   1. Builds the Rust core (dsime) for the MSVC target -> dsime.dll + import lib.
 #   2. Configures + builds the C++ TSF DLL and settings exe with CMake (VS 2022).
-#   3. Stages the trio (dsime_tsf.dll, dsime.dll, DSInputSettings.exe) under
+#   3. Stages the trio (dsime_tsf.dll, dsime.dll, DSPinyinIMESettings.exe) under
 #      windows/dist/<arch>/ — the layout the installer bundles from.
 #
 # Run from a "x64 Native Tools Command Prompt for VS 2022" (PowerShell) or any
@@ -116,7 +116,7 @@ foreach ($a in $Selected) {
 
     $Stage  = Join-Path $DistDir $a
     New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-    foreach ($f in @("dsime_tsf.dll", "DSInputSettings.exe")) {
+    foreach ($f in @("dsime_tsf.dll", "DSPinyinIMESettings.exe")) {
         Copy-Item (Join-Path $OutDir $f) (Join-Path $Stage $f) -Force
     }
     Copy-Item (Join-Path $CoreOut "dsime.dll") (Join-Path $Stage "dsime.dll") -Force
@@ -130,7 +130,7 @@ if ($built.Count -eq 0) {
 
 Write-Host ""
 Write-Host "Built arch(es): $($built -join ', ')" -ForegroundColor Green
-Write-Host "Staged under: $DistDir\<arch>\ (dsime_tsf.dll, dsime.dll, DSInputSettings.exe)"
+Write-Host "Staged under: $DistDir\<arch>\ (dsime_tsf.dll, dsime.dll, DSPinyinIMESettings.exe)"
 Write-Host ""
 Write-Host "To register a build manually (ELEVATED prompt, matching-arch regsvr32):" -ForegroundColor Green
 foreach ($a in $built) {
@@ -138,4 +138,4 @@ foreach ($a in $built) {
 }
 Write-Host ""
 Write-Host "Or build + run the guided installer (installs the host-matching arch):"
-Write-Host "    ./installer/build-installer.ps1 ; ./installer/build/DSInputInstaller.exe"
+Write-Host "    ./installer/build-installer.ps1 ; ./installer/build/DSPinyinIMEInstaller.exe"

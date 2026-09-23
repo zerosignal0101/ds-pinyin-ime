@@ -17,11 +17,11 @@
 #include <windows.h>
 #include <string>
 
-class DSInputBoxWnd {
+class DSPinyinIMEBoxWnd {
 public:
     // Create on the STA thread. Returns nullptr on failure (the IME then works
     // without a visible box rather than not at all).
-    static DSInputBoxWnd* Create(HINSTANCE hInst);
+    static DSPinyinIMEBoxWnd* Create(HINSTANCE hInst);
 
     void Destroy();
 
@@ -52,11 +52,11 @@ public:
     void Hide();
 
 private:
-    DSInputBoxWnd() = default;
-    ~DSInputBoxWnd();
+    DSPinyinIMEBoxWnd() = default;
+    ~DSPinyinIMEBoxWnd();
 
-    DSInputBoxWnd(const DSInputBoxWnd&) = delete;
-    DSInputBoxWnd& operator=(const DSInputBoxWnd&) = delete;
+    DSPinyinIMEBoxWnd(const DSPinyinIMEBoxWnd&) = delete;
+    DSPinyinIMEBoxWnd& operator=(const DSPinyinIMEBoxWnd&) = delete;
 
     static BOOL _RegisterClass(HINSTANCE hInst);
     static LRESULT CALLBACK _WndProc(HWND, UINT, WPARAM, LPARAM);

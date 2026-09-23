@@ -1,5 +1,5 @@
 /*
- * dsime.h — C ABI for the DS Input core engine (Rust crate `dsime`).
+ * dsime.h — C ABI for the DS Pinyin IME core engine (Rust crate `dsime`).
  *
  * Stable interface shared by every platform frontend (Windows TSF today).
  * All strings are UTF-8, NUL-terminated. Pointers returned by the library that

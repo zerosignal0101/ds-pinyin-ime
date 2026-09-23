@@ -73,7 +73,7 @@ fn main() {
 
     let cfg_path = std::env::var("DSIME_CONFIG").unwrap_or_else(|_| {
         let appdata = std::env::var("APPDATA").unwrap();
-        format!("{appdata}\\DSInput\\DSInput\\config\\config.json")
+        format!("{appdata}\\DSPinyinIME\\DSPinyinIME\\config\\config.json")
     });
 
     unsafe {

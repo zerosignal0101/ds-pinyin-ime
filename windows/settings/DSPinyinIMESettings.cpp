@@ -1,6 +1,6 @@
-// DSInputSettings.cpp — standalone Win32 settings dialog for DS Input.
+// DSPinyinIMESettings.cpp — standalone Win32 settings dialog for DS Pinyin IME.
 //
-// A tiny separate process (DSInputSettings.exe) launched from the IME's
+// A tiny separate process (DSPinyinIMESettings.exe) launched from the IME's
 // language-bar menu. It shares the SAME core as the text service, so it reads
 // and writes the SAME config file via ds_engine_get_config_json /
 // ds_engine_set_config_json — there is exactly one source of truth.
@@ -460,7 +460,7 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
                         ::EndDialog(dlg, IDOK);
                     } else {
                         std::wstring msgText = L"Could not save settings.\n\n" + err;
-                        ::MessageBoxW(dlg, msgText.c_str(), L"DS Input",
+                        ::MessageBoxW(dlg, msgText.c_str(), L"DS Pinyin IME",
                                       MB_OK | MB_ICONERROR);
                     }
                     return TRUE;
@@ -489,11 +489,11 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
                     // should see it happen when they ask for it.
                     const int answer = ::MessageBoxW(
                         dlg,
-                        L"Forget everything DS Input has remembered?\n\n"
+                        L"Forget everything DS Pinyin IME has remembered?\n\n"
                         L"This deletes the record of what you have typed since "
                         L"this program started: the text that is sent with each "
                         L"conversion to give the model context. It cannot be undone.",
-                        L"DS Input", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+                        L"DS Pinyin IME", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
                     if (answer != IDYES) return TRUE;
                     if (g_engine.ClearContexts() == DS_OK) {
                         SetText(dlg, IDC_STATUS, L"Stored context cleared.");
@@ -527,8 +527,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // One shared engine for the dialog lifetime; default per-user config path.
     if (!g_engine.Create(nullptr)) {
         std::wstring err = dsime::LastError();
-        std::wstring msgText = L"Failed to load DS Input core engine.\n\n" + err;
-        ::MessageBoxW(nullptr, msgText.c_str(), L"DS Input", MB_OK | MB_ICONERROR);
+        std::wstring msgText = L"Failed to load DS Pinyin IME core engine.\n\n" + err;
+        ::MessageBoxW(nullptr, msgText.c_str(), L"DS Pinyin IME", MB_OK | MB_ICONERROR);
         ::CoUninitialize();
         return 1;
     }

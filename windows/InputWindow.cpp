@@ -22,7 +22,7 @@
 
 namespace {
 
-const wchar_t kBoxClass[] = L"DSInputBoxWnd";
+const wchar_t kBoxClass[] = L"DSPinyinIMEBoxWnd";
 
 // Metrics in DIPs; scaled by the host's DPI at layout time.
 const int kPadX = 10;
@@ -64,10 +64,10 @@ int Scaled(int dip, int dpi) { return ::MulDiv(dip, dpi, 96); }
 
 // ---- lifecycle -------------------------------------------------------------
 
-DSInputBoxWnd* DSInputBoxWnd::Create(HINSTANCE hInst) {
+DSPinyinIMEBoxWnd* DSPinyinIMEBoxWnd::Create(HINSTANCE hInst) {
     if (!_RegisterClass(hInst)) return nullptr;
 
-    DSInputBoxWnd* self = new (std::nothrow) DSInputBoxWnd();
+    DSPinyinIMEBoxWnd* self = new (std::nothrow) DSPinyinIMEBoxWnd();
     if (self == nullptr) return nullptr;
     self->_hInst = hInst;
 
@@ -92,12 +92,12 @@ DSInputBoxWnd* DSInputBoxWnd::Create(HINSTANCE hInst) {
     return self;
 }
 
-DSInputBoxWnd::~DSInputBoxWnd() {
+DSPinyinIMEBoxWnd::~DSPinyinIMEBoxWnd() {
     if (_font) ::DeleteObject(_font);
     if (_smallFont) ::DeleteObject(_smallFont);
 }
 
-void DSInputBoxWnd::Destroy() {
+void DSPinyinIMEBoxWnd::Destroy() {
     if (_hwnd) {
         ::SetWindowLongPtrW(_hwnd, GWLP_USERDATA, 0);
         ::DestroyWindow(_hwnd);
@@ -106,14 +106,14 @@ void DSInputBoxWnd::Destroy() {
     delete this;
 }
 
-BOOL DSInputBoxWnd::_RegisterClass(HINSTANCE hInst) {
+BOOL DSPinyinIMEBoxWnd::_RegisterClass(HINSTANCE hInst) {
     WNDCLASSEXW existing = {};
     if (::GetClassInfoExW(hInst, kBoxClass, &existing)) return TRUE;
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = &DSInputBoxWnd::_WndProc;
+    wc.lpfnWndProc = &DSPinyinIMEBoxWnd::_WndProc;
     wc.hInstance = hInst;
     wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = kBoxClass;
@@ -124,7 +124,7 @@ BOOL DSInputBoxWnd::_RegisterClass(HINSTANCE hInst) {
 
 // ---- content and placement -------------------------------------------------
 
-void DSInputBoxWnd::SetHost(HWND host) {
+void DSPinyinIMEBoxWnd::SetHost(HWND host) {
     if (_host == host) return;
     _host = host;
     if (_hwnd && host) {
@@ -132,7 +132,7 @@ void DSInputBoxWnd::SetHost(HWND host) {
     }
 }
 
-void DSInputBoxWnd::SetAnchor(const RECT& caret) {
+void DSPinyinIMEBoxWnd::SetAnchor(const RECT& caret) {
     // A degenerate rect from GetTextExt means "no position available" (the
     // window is minimised, the text has no layout yet, …). Keep the last good
     // one; the box stays where it was rather than snapping to a screen corner.
@@ -145,7 +145,7 @@ void DSInputBoxWnd::SetAnchor(const RECT& caret) {
     if (_visible) _Relayout();
 }
 
-void DSInputBoxWnd::SetContent(const std::wstring& pinyin, unsigned pending,
+void DSPinyinIMEBoxWnd::SetContent(const std::wstring& pinyin, unsigned pending,
                                bool failed) {
     if (_pinyin == pinyin && _pending == pending && _failed == failed) return;
     _pinyin = pinyin;
@@ -154,14 +154,14 @@ void DSInputBoxWnd::SetContent(const std::wstring& pinyin, unsigned pending,
     _ShowOrHide();
 }
 
-void DSInputBoxWnd::SetMode(bool english, bool flash) {
+void DSPinyinIMEBoxWnd::SetMode(bool english, bool flash) {
     if (_english == english && _flash == flash) return;
     _english = english;
     _flash = flash;
     _ShowOrHide();
 }
 
-void DSInputBoxWnd::_ShowOrHide() {
+void DSPinyinIMEBoxWnd::_ShowOrHide() {
     // Nothing being typed, nothing outstanding, nothing to announce: there is no
     // box to show.
     //
@@ -184,7 +184,7 @@ void DSInputBoxWnd::_ShowOrHide() {
 // `failed` stands alone and wins. It is the only signal that text was lost, and
 // it is sticky until the next successful write, so neither the mode marker nor a
 // count may crowd it out.
-std::wstring DSInputBoxWnd::_StatusText() const {
+std::wstring DSPinyinIMEBoxWnd::_StatusText() const {
     if (_failed) return std::wstring(kFailedBadge);
 
     // The mode is always there. Which language the next key produces is the one
@@ -200,7 +200,7 @@ std::wstring DSInputBoxWnd::_StatusText() const {
     return text;
 }
 
-void DSInputBoxWnd::Hide() {
+void DSPinyinIMEBoxWnd::Hide() {
     if (!_hwnd) return;
     if (_visible) {
         ::ShowWindow(_hwnd, SW_HIDE);
@@ -210,7 +210,7 @@ void DSInputBoxWnd::Hide() {
 
 // ---- painting --------------------------------------------------------------
 
-void DSInputBoxWnd::_EnsureFonts(int dpi) {
+void DSPinyinIMEBoxWnd::_EnsureFonts(int dpi) {
     if (_font && _dpi == dpi) return;
     if (_font) ::DeleteObject(_font);
     if (_smallFont) ::DeleteObject(_smallFont);
@@ -228,7 +228,7 @@ void DSInputBoxWnd::_EnsureFonts(int dpi) {
     _dpi = dpi;
 }
 
-void DSInputBoxWnd::_LineHeights(HDC dc, int* outPinyinH, int* outBadgeH) const {
+void DSPinyinIMEBoxWnd::_LineHeights(HDC dc, int* outPinyinH, int* outBadgeH) const {
     *outPinyinH = 0;
     *outBadgeH = 0;
 
@@ -252,7 +252,7 @@ void DSInputBoxWnd::_LineHeights(HDC dc, int* outPinyinH, int* outBadgeH) const 
     }
 }
 
-void DSInputBoxWnd::_Repaint() {
+void DSPinyinIMEBoxWnd::_Repaint() {
     PAINTSTRUCT ps;
     HDC dc = ::BeginPaint(_hwnd, &ps);
     if (dc == nullptr) return;
@@ -337,7 +337,7 @@ void DSInputBoxWnd::_Repaint() {
 
 // ---- layout ----------------------------------------------------------------
 
-void DSInputBoxWnd::_MeasureContent(int dpi, int* outW, int* outH) {
+void DSPinyinIMEBoxWnd::_MeasureContent(int dpi, int* outW, int* outH) {
     HDC dc = ::GetDC(_hwnd ? _hwnd : nullptr);
     const int padX = Scaled(kPadX, dpi);
     const int padY = Scaled(kPadY, dpi);
@@ -384,7 +384,7 @@ void DSInputBoxWnd::_MeasureContent(int dpi, int* outW, int* outH) {
     *outH = h;
 }
 
-void DSInputBoxWnd::_Relayout() {
+void DSPinyinIMEBoxWnd::_Relayout() {
     if (!_hwnd) return;
 
     const int dpi = DpiOf(_host ? _host : _hwnd);
@@ -427,15 +427,15 @@ void DSInputBoxWnd::_Relayout() {
 
 // ---- window proc -----------------------------------------------------------
 
-LRESULT CALLBACK DSInputBoxWnd::_WndProc(HWND hWnd, UINT msg, WPARAM wParam,
+LRESULT CALLBACK DSPinyinIMEBoxWnd::_WndProc(HWND hWnd, UINT msg, WPARAM wParam,
                                          LPARAM lParam) {
-    DSInputBoxWnd* self =
-        reinterpret_cast<DSInputBoxWnd*>(::GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    DSPinyinIMEBoxWnd* self =
+        reinterpret_cast<DSPinyinIMEBoxWnd*>(::GetWindowLongPtrW(hWnd, GWLP_USERDATA));
     if (self == nullptr) return ::DefWindowProcW(hWnd, msg, wParam, lParam);
     return self->_Handle(msg, wParam, lParam);
 }
 
-LRESULT DSInputBoxWnd::_Handle(UINT msg, WPARAM wParam, LPARAM lParam) {
+LRESULT DSPinyinIMEBoxWnd::_Handle(UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_PAINT:
             _Repaint();

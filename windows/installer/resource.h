@@ -1,4 +1,4 @@
-// resource.h — ids for the DS Input universal installer.
+// resource.h — ids for the DS Pinyin IME universal installer.
 #pragma once
 
 #define IDI_INSTALLER       1

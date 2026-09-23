@@ -1,11 +1,11 @@
-# build-installer.ps1 — build the universal DS Input installer.
+# build-installer.ps1 — build the universal DS Pinyin IME installer.
 #
 #   1. Run ../build.ps1 to produce both arch builds under ../dist/<arch>/.
 #   2. Verify both arches are present (a universal installer needs both).
 #   3. Compile the installer exe (x64, so it runs on x64 and ARM64) with both
 #      payloads embedded.
 #
-# Output: installer/build/<Config>/DSInputInstaller.exe — a single self-contained,
+# Output: installer/build/<Config>/DSPinyinIMEInstaller.exe — a single self-contained,
 # elevated installer.
 
 [CmdletBinding()]
@@ -31,7 +31,7 @@ if (-not $SkipBuild) {
 }
 
 Write-Host "==> Checking staged payloads" -ForegroundColor Cyan
-$files = @("dsime_tsf.dll", "dsime.dll", "DSInputSettings.exe")
+$files = @("dsime_tsf.dll", "dsime.dll", "DSPinyinIMESettings.exe")
 foreach ($a in @("x64", "arm64")) {
     foreach ($f in $files) {
         $p = Join-Path $Win "dist/$a/$f"
@@ -51,13 +51,13 @@ if ($Generator -like "Visual Studio*") {
     if ($LASTEXITCODE -ne 0) { throw "installer cmake configure failed (exit $LASTEXITCODE)" }
     cmake --build $Build --config $Config
     if ($LASTEXITCODE -ne 0) { throw "installer cmake build failed (exit $LASTEXITCODE)" }
-    $Out = Join-Path $Build "$Config/DSInputInstaller.exe"
+    $Out = Join-Path $Build "$Config/DSPinyinIMEInstaller.exe"
 } else {
     cmake -S $Dir -B $Build -G $Generator "-DCMAKE_BUILD_TYPE=$Config"
     if ($LASTEXITCODE -ne 0) { throw "installer cmake configure failed (exit $LASTEXITCODE)" }
     cmake --build $Build
     if ($LASTEXITCODE -ne 0) { throw "installer cmake build failed (exit $LASTEXITCODE)" }
-    $Out = Join-Path $Build "DSInputInstaller.exe"
+    $Out = Join-Path $Build "DSPinyinIMEInstaller.exe"
 }
 Write-Host ""
 Write-Host "Installer built: $Out" -ForegroundColor Green

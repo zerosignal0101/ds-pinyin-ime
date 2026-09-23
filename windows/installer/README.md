@@ -1,10 +1,10 @@
-# DS Input — Windows installer
+# DS Pinyin IME — Windows installer
 
-A single, self-contained, elevated **universal installer** (`DSInputInstaller.exe`)
-for the DS Input TSF IME — the Windows counterpart to the macOS guided installer.
+A single, self-contained, elevated **universal installer** (`DSPinyinIMEInstaller.exe`)
+for the DS Pinyin IME TSF text service — the Windows counterpart to the macOS guided installer.
 
 It **embeds both the x64 and ARM64 builds**, detects the host architecture at run
-time, installs the matching set, registers the text service, and adds DS Input to
+time, installs the matching set, registers the text service, and adds DS Pinyin IME to
 the user's Chinese (Simplified) keyboards.
 
 > Windows has no fat/universal binaries: a TSF text service is an in-proc COM DLL
@@ -17,9 +17,9 @@ the user's Chinese (Simplified) keyboards.
 ## What it does
 
 1. Extracts the host-arch payload (`dsime_tsf.dll`, `dsime.dll`,
-   `DSInputSettings.exe`) to `%ProgramFiles%\DSInput`.
+   `DSPinyinIMESettings.exe`) to `%ProgramFiles%\DS Pinyin IME`.
 2. `regsvr32` the TSF DLL (the native-arch `regsvr32` matches the native-arch DLL).
-3. Adds the DS Input profile to the user's `zh-Hans` language list.
+3. Adds the DS Pinyin IME profile to the user's `zh-Hans` language list.
 4. Tells the user to sign out / back in — Windows enrolls a freshly registered
    text service at the next logon.
 
@@ -30,7 +30,7 @@ From a VS 2022 environment with both MSVC toolsets + the Rust MSVC targets:
 ```powershell
 cd windows
 ./installer/build-installer.ps1            # runs build.ps1 -Arch all, then packages
-# -> installer/build/Release/DSInputInstaller.exe
+# -> installer/build/Release/DSPinyinIMEInstaller.exe
 ```
 
 `build-installer.ps1 -SkipBuild` repackages whatever is already staged in
@@ -38,19 +38,19 @@ cd windows
 
 ## Run
 
-Double-click `DSInputInstaller.exe` (it prompts for administrator). For automation
+Double-click `DSPinyinIMEInstaller.exe` (it prompts for administrator). For automation
 or headless verification, run it silently:
 
 ```powershell
-DSInputInstaller.exe /S        # installs without UI; exit 0 = success, 1 = failure
+DSPinyinIMEInstaller.exe /S        # installs without UI; exit 0 = success, 1 = failure
 ```
 
 ## Files
 
 | File | Role |
 |------|------|
-| `DSInputInstaller.cpp` | Wizard UI + install logic (extract, register, language list); `/S` silent mode. |
-| `DSInputInstaller.rc` | Dialog template, icon, embedded manifest, and the embedded per-arch payloads. |
+| `DSPinyinIMEInstaller.cpp` | Wizard UI + install logic (extract, register, language list); `/S` silent mode. |
+| `DSPinyinIMEInstaller.rc` | Dialog template, icon, embedded manifest, and the embedded per-arch payloads. |
 | `installer.manifest` | `requireAdministrator` + common-controls + DPI awareness. |
 | `CMakeLists.txt` | Builds the installer exe (x64) with `/MANIFEST:NO` (manifest comes from the .rc). |
 | `build-installer.ps1` | Builds both arches then packages the installer. |

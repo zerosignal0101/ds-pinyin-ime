@@ -8,7 +8,7 @@
 #define IDI_DSIME 101
 #endif
 
-// ---- Settings dialog (DSInputSettings.exe) --------------------------------
+// ---- Settings dialog (DSPinyinIMESettings.exe) --------------------------------
 #define IDD_SETTINGS        200
 
 #define IDC_BASE_URL        201

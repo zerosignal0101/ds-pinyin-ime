@@ -3,7 +3,7 @@
 //
 // TSF shows a button for each ITfLangBarItem a service registers with the
 // ITfLangBarItemMgr (reached via the thread manager). Clicking it (or selecting
-// its single menu item) launches DSInputSettings.exe, which edits the shared
+// its single menu item) launches DSPinyinIMESettings.exe, which edits the shared
 // config through the same core (ds_engine_get/set_config_json), so the IME and
 // the settings UI share one source of truth.
 //
@@ -24,7 +24,7 @@
 // Menu command id for the single "Settings…" entry.
 #define DSIME_MENU_SETTINGS 1
 
-// Launch DSInputSettings.exe from the directory this DLL lives in.
+// Launch DSPinyinIMESettings.exe from the directory this DLL lives in.
 static void LaunchSettings() {
     wchar_t path[MAX_PATH] = {};
     DWORD n = ::GetModuleFileNameW(g_hInst, path, MAX_PATH);
