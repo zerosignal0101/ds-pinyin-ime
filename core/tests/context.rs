@@ -268,6 +268,77 @@ fn context_disabled_sends_a_bare_request() {
 }
 
 #[test]
+fn a_new_engine_starts_with_no_context() {
+    let _g = SERIAL.lock().unwrap();
+    let (port, seen) = spawn_seq_mock(vec![TURN_1, TURN_2]);
+    let cfg_path = temp_config("restart");
+    let key = CString::new("notepad3.exe|4242").unwrap();
+
+    unsafe {
+        // First run: one conversion, so there is a history to lose.
+        let (engine, session) = open(&cfg_path, &base_config(port, ""));
+        ds_session_set_context_key(session, key.as_ptr());
+        assert_eq!(convert(session, "nihaoshijie"), "你好世界");
+        ds_session_free(session);
+        ds_engine_free(engine);
+
+        // Second run, same config path and same window key. Nothing carries over:
+        // the context lives in memory and the engine that held it is gone, which
+        // is exactly what not writing it to disk means.
+        let (engine, session) = open(&cfg_path, &base_config(port, ""));
+        ds_session_set_context_key(session, key.as_ptr());
+        assert_eq!(convert(session, "woshigechengxuyuan"), "我是一个程序员");
+        ds_session_free(session);
+        ds_engine_free(engine);
+    }
+
+    let requests = seen.lock().unwrap();
+    let second = messages_of(&requests[1]);
+    assert_eq!(
+        second.len(),
+        2,
+        "history must not outlive the engine that held it, got {second:?}"
+    );
+
+    drop(requests);
+    let _ = std::fs::remove_dir_all(cfg_path.parent().unwrap());
+}
+
+#[test]
+fn empty_context_key_sends_a_bare_request() {
+    let _g = SERIAL.lock().unwrap();
+    let (port, seen) = spawn_seq_mock(vec![TURN_1, TURN_2]);
+    let cfg_path = temp_config("nokey");
+
+    unsafe {
+        let (engine, session) = open(&cfg_path, &base_config(port, ""));
+
+        // What the frontend sends when it cannot tell which window it is typing
+        // into. The ABI calls that "no context", but before this was enforced the
+        // empty key was just another key: every such request filed under "" and
+        // shared one history with every other unidentified window.
+        let empty = CString::new("").unwrap();
+        ds_session_set_context_key(session, empty.as_ptr());
+
+        assert_eq!(convert(session, "nihaoshijie"), "你好世界");
+        assert_eq!(convert(session, "woshigechengxuyuan"), "我是一个程序员");
+
+        ds_session_free(session);
+        ds_engine_free(engine);
+    }
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(
+        messages_of(&requests[1]).len(),
+        2,
+        "an unidentified window must not accumulate (or share) a history"
+    );
+
+    drop(requests);
+    let _ = std::fs::remove_dir_all(cfg_path.parent().unwrap());
+}
+
+#[test]
 fn compaction_folds_the_history_and_keeps_the_recent_turns() {
     let _g = SERIAL.lock().unwrap();
     // The first response reports a prompt of 350 tokens against a 400-token

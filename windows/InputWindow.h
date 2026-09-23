@@ -36,6 +36,14 @@ public:
     // An empty `pinyin` with nothing pending hides the box.
     void SetContent(const std::wstring& pinyin, unsigned pending, bool failed);
 
+    // Which mode the text service is in, drawn as a 中/英 marker on the status
+    // line. `flash` additionally holds the box on screen even with an empty
+    // buffer and an empty queue — that is Ctrl+Space's only feedback when
+    // nothing else is going on, and the caller's timer clears it. The marker is
+    // drawn whenever the box is up; only `flash` keeps it there, which is what
+    // stops English mode from parking a panel over the document indefinitely.
+    void SetMode(bool english, bool flash);
+
     // Where the caret is, in SCREEN coordinates, as returned by
     // ITfContextView::GetTextExt. A degenerate rect means "position unknown":
     // the box then keeps its last position rather than jumping to a corner.
@@ -55,6 +63,11 @@ private:
     LRESULT _Handle(UINT msg, WPARAM wParam, LPARAM lParam);
 
     void _EnsureFonts(int dpi);
+    // Apply the show/hide rule to whatever the current content and mode are.
+    // Shared by SetContent and SetMode so the decision genuinely exists once:
+    // it is a four-term condition, and a second copy of it would be the place a
+    // new state gets forgotten.
+    void _ShowOrHide();
     // Height of each line the box may show, in the fonts the painter uses.
     // Measured in one place because _MeasureContent sizes the window and
     // _Repaint draws into it, and any disagreement between them shows up as one
@@ -73,6 +86,15 @@ private:
     std::wstring _pinyin;
     unsigned _pending = 0;
     bool _failed = false;
+
+    // The mode marker, and whether it is currently holding the box open.
+    bool _english = false;
+    bool _flash = false;
+
+    // The status line's text: the mode, plus the pending count when there is one,
+    // or the failure notice instead of both. Built in one place because the same
+    // string decides the window's height and gets painted into it.
+    std::wstring _StatusText() const;
 
     // Caret position in screen coordinates; empty (all zero) until the caller
     // supplies a plausible one.

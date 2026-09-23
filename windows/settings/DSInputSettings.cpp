@@ -482,9 +482,10 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
                     // should see it happen when they ask for it.
                     const int answer = ::MessageBoxW(
                         dlg,
-                        L"Forget the remembered context for every window?\n\n"
-                        L"This deletes the stored record of what you have typed, "
-                        L"including the copy on disk. It cannot be undone.",
+                        L"Forget everything DS Input has remembered?\n\n"
+                        L"This deletes the record of what you have typed since "
+                        L"this program started: the text that is sent with each "
+                        L"conversion to give the model context. It cannot be undone.",
                         L"DS Input", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
                     if (answer != IDYES) return TRUE;
                     if (g_engine.ClearContexts() == DS_OK) {

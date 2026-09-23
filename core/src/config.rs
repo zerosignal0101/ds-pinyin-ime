@@ -20,7 +20,42 @@ pub const DEFAULT_REASONING_EFFORT: &str = "low";
 // Kept byte-stable and sent as the first (system) message on every request so it
 // forms a constant cacheable prefix — DeepSeek context caching then bills it at
 // the cache-hit rate and doesn't reprocess it on each incremental keystroke.
+//
+// Changing this text is NOT enough to ship the change: the prompt is *stored* in
+// config.json, so every install that has ever run the app keeps whatever it was
+// given at the time. Freeze the outgoing value in [`LEGACY_SYSTEM_PROMPTS`] and
+// the upgrade in [`Config::upgrade_default_prompt`] will carry the new one to
+// users who never customised it. Editing this string without adding the old one
+// there means the edit reaches nobody.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
+Convert toneless Hanyu Pinyin into the single most natural sentence. The input \
+may MIX pinyin with English words, numbers, emails, URLs, and code identifiers: \
+convert the pinyin parts to Chinese and keep the non-pinyin parts verbatim. Use \
+spaces and context to tell pinyin from English; an apostrophe only marks a pinyin \
+syllable boundary (xi'an = 西安).\n\
+Rules:\n\
+- Output ONLY the result: no explanation, quotes, extra whitespace, or \
+alternatives.\n\
+- Convert pinyin to Chinese; keep English words, numbers, emails, URLs, and code \
+identifiers exactly as written.\n\
+- A run of two or more UPPER-CASE letters (AI, ICT, PDF, URL) is an English \
+abbreviation: keep it exactly as written and never read it as pinyin. A lower-case \
+run is pinyin, as usual.\n\
+- Use full-width Chinese punctuation amid Chinese; keep ASCII punctuation inside \
+English and identifiers.\n\
+- Examples: \"wo yong python xie daima\" -> \"我用python写代码\"; \"shiyongAI\" -> \
+\"使用AI\".\n\
+- If the input is empty or has no pinyin, return it unchanged.";
+
+/// Every past value of [`DEFAULT_SYSTEM_PROMPT`], verbatim, oldest first.
+///
+/// A config file carries its own copy of the prompt, so a user who has launched
+/// the app even once still holds the text they were first given. This list is
+/// how that text is recognised on load: an exact match means "never customised",
+/// and the current default replaces it. Anything else is a user's own edit and
+/// is left alone — which is why the comparison is byte-for-byte and why an entry
+/// must never be edited after the fact, only appended to.
+pub const LEGACY_SYSTEM_PROMPTS: &[&str] = &["\
 Convert toneless Hanyu Pinyin into the single most natural sentence. The input \
 may MIX pinyin with English words, numbers, emails, URLs, and code identifiers: \
 convert the pinyin parts to Chinese and keep the non-pinyin parts verbatim. Use \
@@ -34,7 +69,7 @@ identifiers exactly as written.\n\
 - Use full-width Chinese punctuation amid Chinese; keep ASCII punctuation inside \
 English and identifiers.\n\
 - Example: \"wo yong python xie daima\" -> \"我用python写代码\".\n\
-- If the input is empty or has no pinyin, return it unchanged.";
+- If the input is empty or has no pinyin, return it unchanged."];
 
 /// Instruction for the context-compaction call. The conversion history is folded
 /// into a short "scene" note that then rides in front of every later request.
@@ -215,9 +250,16 @@ impl Config {
     pub fn load_or_create(path: &Path) -> std::io::Result<Config> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let cfg: Config = serde_json::from_str(&text).map_err(|e| {
+                let mut cfg: Config = serde_json::from_str(&text).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                 })?;
+                if cfg.upgrade_default_prompt() {
+                    // Best effort. A read-only config directory must not stop the
+                    // IME from running -- it just means the user gets the new
+                    // prompt again next launch, and it is upgraded in memory
+                    // either way.
+                    let _ = cfg.save(path);
+                }
                 Ok(cfg)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -227,6 +269,24 @@ impl Config {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Move a stock system prompt forward to the current default.
+    ///
+    /// The prompt is stored in the config file, so changing
+    /// [`DEFAULT_SYSTEM_PROMPT`] in code reaches an existing install only
+    /// through here. Only an exact match against a frozen
+    /// [`LEGACY_SYSTEM_PROMPTS`] entry is rewritten -- that is what "the user
+    /// never touched it" looks like. Anything else is their own text and is left
+    /// exactly as written.
+    ///
+    /// Returns true when the prompt changed and the config wants saving.
+    fn upgrade_default_prompt(&mut self) -> bool {
+        if !LEGACY_SYSTEM_PROMPTS.contains(&self.system_prompt.as_str()) {
+            return false;
+        }
+        self.system_prompt = DEFAULT_SYSTEM_PROMPT.to_string();
+        true
     }
 
     /// Pretty-print to `path`, creating parent directories as needed.
@@ -304,6 +364,62 @@ mod tests {
         let c3 = Config::load_or_create(&path).unwrap();
         assert_eq!(c3.api_key, "sk-roundtrip");
         assert_eq!(c3.model, "gpt-4o-mini");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_default_prompt_is_upgraded() {
+        // Distinct temp dir per test: these run in parallel threads of one
+        // process, so a pid-only name would collide with round_trips_through_disk.
+        let dir = std::env::temp_dir().join(format!("dsime-cfg-old-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A prompt that IS a past default means the user never edited it, so it
+        // is ours to move forward.
+        let stale = Config {
+            system_prompt: LEGACY_SYSTEM_PROMPTS[0].to_string(),
+            ..Config::default()
+        };
+        stale.save(&path).unwrap();
+
+        let loaded = Config::load_or_create(&path).unwrap();
+        assert_eq!(loaded.system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("UPPER-CASE"),
+            "the upgrade has to be written back, or Settings would still show the \
+             old text and a later Save would resurrect it"
+        );
+
+        // Listing the current default as a legacy value would make the upgrade a
+        // no-op that looks like it works.
+        assert!(!LEGACY_SYSTEM_PROMPTS.contains(&DEFAULT_SYSTEM_PROMPT));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_customised_prompt_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("dsime-cfg-mine-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Anything that is not a byte-for-byte past default is the user's own
+        // text, and a "helpful" rewrite would silently discard their work.
+        let mine = Config {
+            system_prompt: "CONVERT THIS MY WAY".to_string(),
+            ..Config::default()
+        };
+        mine.save(&path).unwrap();
+
+        let loaded = Config::load_or_create(&path).unwrap();
+        assert_eq!(loaded.system_prompt, "CONVERT THIS MY WAY");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("CONVERT THIS MY WAY"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -18,10 +18,26 @@ letter. The full interaction model:
 | Key | Effect |
 |-----|--------|
 | `a`–`z`, `'`, and the punctuation we own | append to the raw buffer (drawn in the floating box) |
+| **Shift+letter** | same, but the letter is kept **upper-case** — see below |
 | **Space** | hand the buffer to the queue; the pinyin disappears at once and typing continues |
 | **Enter** | write the buffer verbatim, no conversion |
 | **Esc** | discard what is being typed; the queue keeps running |
 | **Backspace** | edit the buffer |
+| **Ctrl+Space** | toggle Chinese/English mode — see below |
+
+**Shift is how an abbreviation survives.** `shiyongAI` is converted to `使用AI`;
+the flattened `shiyongai` gives the model no reason to prefer `AI` over `爱`,
+because everything around it is pinyin. So a capital is kept as a capital, and the
+case is read from the **Shift key**, never from the character `ToUnicode` produced
+— with CapsLock on, the latter returns capitals for ordinary typing too, and every
+sentence would arrive as `NIHAO`. The rule the model gets is scoped to *runs of two
+or more* capitals, so a stuck Shift cannot invert the IME into writing English.
+
+**English mode (Ctrl+Space) has no buffer at all.** Nothing typed is pinyin and
+nothing is remapped to full-width, so every printable key takes the literal path:
+queued behind any sentence still on its way, and handed to the host when the queue
+is empty — which is what makes typing a whole sentence of English feel native.
+A buffer in progress when the mode flips is flushed **verbatim**, not converted.
 
 Conversions run **strictly one at a time, in order**, each writing at the anchor
 captured when its Space was pressed — so a sentence still lands in the document
@@ -164,10 +180,62 @@ equivalent of running the guided installer.
   `TF_E_LOCKED` means try again shortly. And **`GetTextExt` returning `S_OK`
   proves nothing**: a minimised window yields `S_OK` with an all-zero rect, so
   callers must test the rect (`IsDegenerate` in `windows/Globals.h`).
+- **`TF_S_ASYNC` is a success code that is not a completion.** `0x00040300` —
+  severity 0 — means "accepted and queued", and `FAILED()` is false for it, so it
+  slips through every failure check. Which of the two readings applies depends on
+  the caller, and getting it wrong is silent in both directions:
+  - A session whose *output* you need has not run, so a null out-param is **not**
+    a refusal. `Dsime_RequestInsertText` opens a composition before writing, and
+    reading a queued (so still-null) composition handle as "this host refused"
+    dropped it into the bare-write fallback — the path documented not to notify.
+    The sentence landed in the document and was never repainted: present, and
+    invisible. It now returns `TF_S_ASYNC` upward untranslated, and `_FinishJob`
+    retries it on the pump timer alongside `TF_E_LOCKED` — both mean "nothing
+    written yet".
+  - A session that only has to *eventually happen* may be accepted as success;
+    TSF runs queued sessions in submission order. The write and close steps do
+    this, and normalise the code to `S_OK` so the caller does not retry a write
+    that is already queued — that would insert the sentence twice.
+  Asking for an edit session during a **key event's test phase** is what triggers
+  the deferral in practice; the same call from a posted message is granted
+  inline.
 - **A new `core::config::Config` field must be added to the Settings dialog** (or
   carried through it). Saving replaces the whole JSON object and every field is
   `#[serde(default)]`, so an omitted field is not preserved — it silently reverts
   to its default.
+- **Changing `DEFAULT_SYSTEM_PROMPT` reaches nobody on its own.** The prompt is
+  *stored* in config.json, so every install that has ever run the app keeps the
+  text it was first given — a rule the user cannot receive is not a fix. Pair the
+  change with the outgoing value frozen into `LEGACY_SYSTEM_PROMPTS`
+  (`core/src/config.rs`), which `Config::load_or_create` matches byte-for-byte and
+  upgrades; anything else is the user's own edit and is left alone. Add the
+  example to the *rule* too: few-shot examples dominate instructions here.
+- **Ctrl+Space has two separate ways to go wrong, and they need opposite fixes.**
+  1. *Windows may own the chord.* The Chinese language pack ships a legacy hotkey,
+     "输入法/非输入法切换", bound to Ctrl+Space and handled by the input-language
+     layer, below TSF. When it fires, the whole text service is deactivated: the
+     trace shows `deactivate` and no key event at all. `PreserveKey` cannot help
+     here — the OS has already consumed the key. The user has to give the chord up
+     under 高级键盘设置, which is a prerequisite, not a workaround. (Note the
+     dialog has no "None" option: you must untick **启用按键顺序**.)
+  2. *Even once we own it, the handle phase is not reliably delivered.* With a
+     composition live, the trace shows `OnTestKeyDown` running, `_IsKeyEaten`
+     answering "eaten" — and **`OnKeyDown` never arriving**, so a switch written
+     in `OnKeyDown` worked with an empty buffer and silently did nothing with a
+     full one. The fix is to **do the switch in `OnTestKeyDown`**, the one
+     callback delivered in both states. Weasel does the same, for the same class
+     of host misbehaviour: its `OnTestKeyDown` runs the engine and the composition
+     update, and its `OnKeyDown` only eats the key. (`ITfKeystrokeMgr::PreserveKey`
+     is the documented answer and is *worse* here — it takes the key at the test
+     stage while `OnPreservedKey` is delivered from the missing handle phase, and
+     the chord went completely dead. Tried, measured, removed.) `_ToggleEnglishMode`
+     drops a repeat inside 200 ms, which is what makes the test phase safe: hosts
+     that reach both callbacks, and hosts that send several tests per press (MS
+     Word 2010 x64), cannot turn one chord into two switches.
+- **The mode flash needs a timer id of its own.** `SetTimer` on an id that is
+  already armed *replaces* that timer, interval included — id 2 is the
+  `TF_E_LOCKED` insert retry, so sharing it would let a mode change silently
+  cancel a retry and with it a sentence.
 - **Insert committed text with `ITfInsertAtSelection::InsertTextAtSelection`, not
   with `ITfRange::SetText`.** MSDN's `ITextStoreACP::SetText` contract says an
   application *"should not call the `ITextStoreACPSink::OnTextChange` method in
@@ -213,8 +281,17 @@ user must set it. The conversion behavior lives in
 `config.rs::DEFAULT_SYSTEM_PROMPT`, and the compaction prompt in
 `config.rs::DEFAULT_CONTEXT_PROMPT`.
 
-The **conversation context** is a separate store, not config: one JSON file per
-input window under `%APPDATA%\DSInput\DSInput\context\`, written by
-`core/src/context.rs`. It is a record of what the user has typed, including a copy
-on disk, so it has an explicit exit — `ds_engine_clear_contexts`, wired to the
-Clear button in Settings.
+The **conversation context** is a separate store, not config, and lives **in
+memory only** (`core/src/context.rs`): what the user has typed in this program
+instance, carried into the next conversion. Nothing is written to disk — it is a
+record of document text, and a copy on disk outlived the document it described
+while still being prepended to every request at token prices. `ds_engine_clear_contexts`
+forgets it now and deletes whatever a version that *did* persist left beside the
+config file; it is wired to the Clear button in Settings.
+
+Contexts are keyed `{exe}|{pid}` — per **process**, which is what separates two
+Notepad3 instances (they share a window class, so keying on that mixed one file's
+vocabulary into another's). Two consequences worth knowing: the engine is built
+per activation, so **switching input methods away and back loses the history**
+(previously it came back from disk), and one process is one context, so Electron
+and VS Code still share across their windows.

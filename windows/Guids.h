@@ -43,6 +43,12 @@ DEFINE_GUID(c_guidDsimeProfile,
 DEFINE_GUID(c_guidDsimeLangBarItem,
     0xc3d4e5f6, 0x7708, 0x491a, 0xab, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef);
 
+// NB: {D4E5F607-8819-4A2B-BC34-56789ABCDEF0} was briefly a preserved-key GUID
+// for Ctrl+Space, registered with ITfKeystrokeMgr::PreserveKey. It never shipped
+// and is not registered anywhere, so the value is free — but the approach was
+// abandoned rather than merely unused: see the note on OnPreservedKey in
+// KeyEventSink.cpp before reintroducing it.
+
 // BCP-47 language tag for the profile. zh-Hans → LANGID 0x0804 (Simplified,
 // PRC). TSF profiles are keyed by LANGID; 0x0804 is zh-CN.
 #define DSIME_LANGID  0x0804

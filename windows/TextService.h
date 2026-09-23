@@ -34,10 +34,21 @@
 //     us an insertion point that TSF keeps valid across edits.
 //   * Subsequent keys -> append to the raw buffer and repaint the box. No
 //     network traffic, no document writes, no timer.
+//   * Shift+letter -> still buffer, but kept as a CAPITAL, so an abbreviation
+//     reaches the model as one: "shiyongAI" converts to 使用AI, where the
+//     flattened "shiyongai" would just be read as more pinyin.
 //   * Space -> snapshot the buffer and the caret into a PendingJob and hand it
 //     to the queue. The pinyin disappears at once and typing continues.
 //   * Enter -> write the raw buffer verbatim, with no conversion.
-//   * Esc -> discard what is being typed. The queue keeps running.
+//   * Esc -> discard what is being typed. The queue keeps running. Deliberately
+//     does NOT leave English mode: a key that silently changes the input mode is
+//     worse than one that does nothing, and the box already says which mode is on.
+//   * Ctrl+Space -> toggle Chinese/English (_ToggleEnglishMode). ENGLISH MODE
+//     HAS NO BUFFER: nothing is pinyin and nothing is remapped to full-width, so
+//     every printable key takes the literal path above — queued behind any
+//     sentence still on its way, and handed to the host when the queue is empty,
+//     which is what makes typing a whole sentence of English feel native. A
+//     buffer in progress when the mode flips is flushed verbatim, not converted.
 //   * TSF may terminate the composition itself (focus loss, app teardown) ->
 //     OnCompositionTerminated clears our typing state.
 //
@@ -77,6 +88,19 @@ class DSInputBoxWnd;
 // a reposition is due, and the work happens here, as soon as the lock is gone.
 #define WM_DSIME_RELOCATE        (WM_USER + 0x101)
 
+// Posted to ourselves to run a queued literal insertion.
+//
+// The insert sessions use TF_ES_ASYNCDONTCARE, because they normally run from a
+// posted message, where TF_ES_SYNC is not permitted. Ask for one during a *key
+// event* instead — which is what happens when Ctrl+Space flushes the buffer from
+// the test phase — and TSF defers it: the session has not run yet, so the
+// composition handle it was supposed to produce is still null, and the caller
+// concludes it could not open one and takes the bare-write fallback. That path is
+// documented not to notify, so the text lands in the document and the host never
+// repaints it: the sentence is there and invisible. Posting the pump puts the
+// insert back in the context it was written for.
+#define WM_DSIME_PUMP            (WM_USER + 0x102)
+
 // Timer on the hidden window: re-locates the floating box while the user is
 // typing. Hosts that never fire ITfTextLayoutSink (or that move the caret
 // without changing the text) are only tracked this way.
@@ -88,6 +112,14 @@ class DSInputBoxWnd;
 #define DSIME_PUMP_TIMER_ID      2
 #define DSIME_PUMP_TIMER_MS      50
 #define DSIME_MAX_INSERT_RETRIES 20
+
+// Timer on the hidden window: how long Ctrl+Space's "English"/"Chinese" notice
+// stays on screen when there is nothing else for the box to show. It must be an
+// id of its own: SetTimer on an id that is already armed *replaces* that timer,
+// interval and all, so sharing the pump's id 2 would let a mode change quietly
+// cancel a pending insertion retry.
+#define DSIME_FLASH_TIMER_ID     3
+#define DSIME_FLASH_TIMER_MS     900
 
 // One sentence on its way to the document.
 //
@@ -103,11 +135,16 @@ struct PendingJob {
     // Phase 1 -> phase 2. The conversion is issued first; once its terminal
     // result lands, `converted` flips and `result` holds the Chinese.
     bool converted = false;
-    // Text the user typed that needs no conversion — punctuation emitted with
-    // no buffer to append it to. Such a job is born `converted`, so the pump
-    // hands it straight to the inserter and never contacts the model.
+    // Text the user typed that needs no conversion. Three things arrive this
+    // way, and all of them are born `converted`, so the pump hands them straight
+    // to the inserter and never contacts the model:
     //
-    // Why it is a queue job at all, rather than being written on the spot: a
+    //   * punctuation (and spaces, digits, other printables) typed with nothing
+    //     in the buffer while sentences are still owed to the document;
+    //   * every character typed in English mode;
+    //   * the buffer itself, when Ctrl+Space interrupts it.
+    //
+    // Why they are queue jobs at all, rather than being written on the spot: a
     // queued sentence is inserted with ITfInsertAtSelection::InsertTextAtSelection,
     // which lands at *the selection as it stands when its turn comes* (the anchor
     // only decides where the composition is parked, and starting one sets the
@@ -115,6 +152,9 @@ struct PendingJob {
     // past it, and the sentence arrives behind it: the user reads "，你好" and
     // blames the conversion. Taking a number and waiting is what makes the comma
     // land after the text it follows, and it matches what was meant anyway.
+    //
+    // Consecutive literal *characters* from English mode are merged into one job
+    // rather than one job each — see _EnqueueIdleChar.
     bool literal = false;
     // The core dropped this request deliberately (teardown). No result, and no
     // pinyin fallback either — there is nowhere left to put it.
@@ -228,6 +268,17 @@ private:
     // a caret in the right place.
     void    _ReanchorIfComposing(ITfContext* pic);
 
+    // ---- Chinese/English mode (KeyEventSink.cpp) -----------------------------
+    // Flip the mode, flushing any buffer first (verbatim — the user asked to
+    // stop typing pinyin, not to have it converted), and flash the box so the
+    // new mode is visible even with nothing else to show.
+    void    _ToggleEnglishMode(ITfContext* pic);
+    // Hand the buffer to the queue as a literal job: the same four steps as
+    // _EnqueueConversion, minus the model. A failure to capture the anchor leaves
+    // the buffer alone and sets _flushBufferAsLiteralDue, so nothing is lost and
+    // nothing is written out of turn.
+    void    _FlushBufferAsLiteral(ITfContext* pic);
+
     // ---- the floating input box ---------------------------------------------
     // `canProbeCaret` gates the synchronous caret probe. It MUST be false on the
     // paths that run from a TSF callback — a focus change, a composition torn
@@ -322,6 +373,32 @@ private:
     // treating a stale handle as "we are composing" would have Backspace delete
     // document text while the box still shows pinyin.
     bool _composing = false;
+
+    // English mode: nothing typed is pinyin, nothing is remapped, and there is no
+    // buffer — see the INPUT MODEL note above. Per activation (TSF gives us one
+    // CTextService per thread), not persisted, and not reset by focus changes:
+    // it is a mode the user chose, not a property of a document.
+    bool _englishMode = false;
+
+    // The mode notice is on screen because Ctrl+Space put it there, and the box
+    // should show itself even with an empty buffer until the flash timer takes it
+    // away. Without this, switching mode with nothing queued would give no
+    // feedback at all; with it left on, a panel would sit over the document for
+    // as long as English mode lasted.
+    bool _modeFlash = false;
+
+    // Ctrl+Space found a buffer it could not hand to the queue — the anchor could
+    // not be captured, which happens when the document refuses a synchronous edit
+    // session. The flush is retried at the top of the next keystroke, where one
+    // is available; until then the buffer stays in the box and Space still
+    // converts it, so nothing is stranded.
+    bool _flushBufferAsLiteralDue = false;
+
+    // Tick of the last mode change. Ctrl+Space can arrive down both routes — the
+    // preserved key and the key sink — and two toggles in a row are
+    // indistinguishable from the switch not working at all, so a repeat inside
+    // 200 ms is dropped.
+    ULONGLONG _lastToggleTick = 0;
 
     // Set while we replace a composition ourselves, so the termination sink does
     // not mistake it for the app yanking our composition away and drop the

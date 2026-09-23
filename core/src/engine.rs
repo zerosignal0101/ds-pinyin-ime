@@ -153,10 +153,15 @@ impl EngineHandle {
             .build()
             .map_err(|e| format!("failed to build http client: {e}"))?;
 
-        // Context files live beside the config file, so a caller that points the
-        // core at its own config path (the CLI example, tests) keeps its contexts
-        // with it instead of in the real user profile.
+        // Contexts are in memory only, so the config directory is used for one
+        // thing: finding — and deleting — what an older version of this core
+        // wrote there. That is also why it is derived from `config_path` rather
+        // than a fixed `%APPDATA%`: a caller that points the core at its own
+        // config path (the CLI example, tests) must clean up beside *that*, not
+        // in the real user profile, and the purge filters by file name so it can
+        // never take something that was not ours.
         let contexts = ContextStore::new(config_path.parent().map(|p| p.join("context")));
+        contexts.purge_legacy_dir();
 
         let engine = Arc::new(Engine {
             // Tasks spawn onto this handle; the Runtime itself stays in `rt`.
@@ -290,15 +295,26 @@ impl Engine {
     }
 }
 
+/// Is context out of the picture for this request?
+///
+/// An empty key means the frontend could not work out which window it is typing
+/// into. The ABI documents that as "no context for this request", and it has to
+/// be honoured *here*: without the check, every such request files under `""` and
+/// shares one history, so unrelated documents would teach the model each other's
+/// vocabulary — a worse outcome than having no context at all.
+fn context_off(cfg: &Config, key: &str) -> bool {
+    !cfg.context_enabled || key.is_empty()
+}
+
 /// The window's context, or an empty one when the feature is switched off.
 ///
 /// Disabling the feature stops *using* the stored history without deleting it,
 /// so switching it back on resumes where the user left off.
 fn load_context(engine: &Engine, cfg: &Config, key: &str) -> WindowContext {
-    if cfg.context_enabled {
-        engine.contexts.snapshot(key, cfg)
-    } else {
+    if context_off(cfg, key) {
         WindowContext::default()
+    } else {
+        engine.contexts.snapshot(key, cfg)
     }
 }
 
@@ -322,6 +338,11 @@ async fn compact_if_needed(
 /// The window's context as a request should see it, compacted first if it has
 /// outgrown its budget.
 async fn prepare_context(engine: &Engine, cfg: &Config, key: &str, pinyin: &str) -> WindowContext {
+    // Before `load_context`, because the compaction path below *writes*: an
+    // update under an empty key would create the entry this is meant to avoid.
+    if context_off(cfg, key) {
+        return WindowContext::default();
+    }
     let ctx = load_context(engine, cfg, key);
     let Some(summary) = compact_if_needed(engine, cfg, &ctx, pinyin).await else {
         return ctx;
@@ -335,7 +356,7 @@ async fn prepare_context(engine: &Engine, cfg: &Config, key: &str, pinyin: &str)
 /// Fold a completed conversion into the window's context, so the next request in
 /// that window sees what has already been written.
 fn remember(engine: &Engine, cfg: &Config, key: &str, pinyin: &str, completed: &api::Completed) {
-    if !cfg.context_enabled {
+    if context_off(cfg, key) {
         return;
     }
     engine.contexts.update(key, cfg, |c| {

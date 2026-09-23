@@ -87,12 +87,13 @@ int32_t   ds_engine_set_config_json(DsEngine *engine, const char *json_utf8);
 /* The configured config file path (caller frees). */
 char     *ds_engine_config_path(DsEngine *engine);
 
-/* Forget every remembered input window's conversation context, in memory and on
- * disk. Returns DS_OK or DS_ERR_CONFIG.
+/* Forget every remembered input window's conversation context. Returns DS_OK or
+ * DS_ERR_CONFIG.
  *
- * The context is a record of what the user has typed — including a copy on disk
- * beside the config file — so callers need a way to be rid of it that does not
- * mean hunting for files. */
+ * The context is a record of what the user has typed, so callers need a way to
+ * be rid of it that does not mean hunting for files. Contexts live in memory
+ * only; this also deletes whatever a version that did write them to disk left
+ * beside the config file. */
 int32_t   ds_engine_clear_contexts(DsEngine *engine);
 
 /* How many conversions the frontend should let pile up before it stops
@@ -115,12 +116,18 @@ void       ds_session_set_input(DsSession *session, const char *pinyin_ascii);
 /* The current raw pinyin buffer (caller frees). Never NULL. */
 char      *ds_session_get_input(DsSession *session);
 
-/* Name the input window this session is typing into, e.g. "code.exe|Chrome_WidgetWin_1".
- * The conversation context is filed under this key, so the model keeps seeing the
- * domain, terminology and wording of what is already written in that window, and
- * starts clean in a different one. Set it before each conversion: one session
- * outlives any single document. An empty key (or never calling this) disables
- * context for that request. The string is copied — the caller keeps ownership. */
+/* Name the window this session is typing into, e.g. "notepad3.exe|4242" — the
+ * executable plus its process id, which is as close to "this document" as a text
+ * service can get without reading the title. The conversation context is filed
+ * under this key, so the model keeps seeing the domain, terminology and wording
+ * of what is already written there, and starts clean anywhere else. Set it
+ * before each conversion: one session outlives any single document.
+ *
+ * Contexts are held in memory for the life of the engine, so they are lost when
+ * the frontend drops it — a restart, or switching to another input method and
+ * back. An empty key (or never calling this) disables context for that request,
+ * which is what a frontend that cannot identify its window should send.
+ * The string is copied — the caller keeps ownership. */
 void       ds_session_set_context_key(DsSession *session, const char *key_utf8);
 
 /* Kick off async conversion of the current buffer. Cancels any previous

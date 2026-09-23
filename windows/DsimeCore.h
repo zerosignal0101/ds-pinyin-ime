@@ -139,8 +139,9 @@ public:
     uint32_t QueueMaxPending() const {
         return e_ ? ds_engine_queue_max_pending(e_) : 0;
     }
-    // Forget every remembered window's conversation context, in memory and on
-    // disk.
+    // Forget every remembered window's conversation context. It lives in memory
+    // only, so this forgets what the running engine holds and deletes whatever an
+    // older build wrote beside the config file.
     int32_t ClearContexts() { return e_ ? ds_engine_clear_contexts(e_) : DS_ERR_CONFIG; }
 
     void reset() {
@@ -184,11 +185,13 @@ public:
         return CoreString(s_ ? ds_session_get_input(s_) : nullptr);
     }
 
-    // Name the input window this session is typing into, e.g.
-    // "code.exe|Chrome_WidgetWin_1". The conversation context is filed under this
-    // key, so the model keeps seeing the domain and terminology of what is
-    // already written in that window. Set it before each conversion; the core
-    // copies the string. Empty (the default) disables context for the request.
+    // Name the window this session is typing into, e.g. "notepad3.exe|4242": the
+    // executable plus its process id. The conversation context is filed under
+    // this key, so the model keeps seeing the domain and terminology of what is
+    // already written there and starts clean anywhere else. Set it before each
+    // conversion; the core copies the string, and holds the context in memory for
+    // the life of the engine. Empty (the default) disables context for the
+    // request — which is what to send when the window cannot be identified.
     void SetContextKey(const std::string& key_utf8) {
         if (s_) ds_session_set_context_key(s_, key_utf8.c_str());
     }

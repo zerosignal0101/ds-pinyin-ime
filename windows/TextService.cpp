@@ -13,6 +13,7 @@
 
 #include "TextService.h"
 #include "Globals.h"
+#include "Guids.h"
 #include "InputWindow.h"
 #include "Trace.h"
 
@@ -138,6 +139,14 @@ fail:
 }
 
 STDMETHODIMP CTextService::Deactivate() {
+    // Logged unconditionally, because this firing is itself a diagnosis: the text
+    // service is being switched out, and one of the things that can do that is
+    // Windows' own "输入法/非输入法切换" hotkey — bound to Ctrl+Space by default.
+    // A "deactivate" in the trace with no "test: space" line ahead of it is the
+    // signature of Ctrl+Space never reaching us at all.
+    DsimeTrace(L"=== deactivate (english=%d jobs=%u)", static_cast<int>(_englishMode),
+               static_cast<unsigned>(_jobs.size()));
+
     // Tear down in reverse order of Activate. Each helper is idempotent.
     _UninitLanguageBar();
     _UninitKeyEventSink();
@@ -148,6 +157,7 @@ STDMETHODIMP CTextService::Deactivate() {
     if (_msgWnd) {
         ::KillTimer(_msgWnd, DSIME_LAYOUT_TIMER_ID);
         ::KillTimer(_msgWnd, DSIME_PUMP_TIMER_ID);
+        ::KillTimer(_msgWnd, DSIME_FLASH_TIMER_ID);
     }
 
     // Drop the queue by hand rather than relying on callbacks. The core
@@ -185,6 +195,12 @@ STDMETHODIMP CTextService::Deactivate() {
     _threadFocused = true;
     _writeFailed = false;
     _maxPending = 0;
+    // The mode belongs to the activation, so a re-activation starts in Chinese
+    // rather than in whatever state the last one was left in.
+    _englishMode = false;
+    _modeFlash = false;
+    _flushBufferAsLiteralDue = false;
+    _lastToggleTick = 0;
 
     if (_pThreadMgr) {
         _pThreadMgr->Release();
@@ -515,6 +531,13 @@ LRESULT CALLBACK CTextService::_MsgWndProc(HWND hWnd, UINT msg,
         return 0;
     }
 
+    if (msg == WM_DSIME_PUMP) {
+        // A literal insertion deferred out of a key event — see WM_DSIME_PUMP.
+        if (self == nullptr) return 0;
+        self->_PumpQueue();
+        return 0;
+    }
+
     if (msg == WM_TIMER) {
         if (self == nullptr) return 0;
         if (wParam == DSIME_LAYOUT_TIMER_ID) {
@@ -525,6 +548,15 @@ LRESULT CALLBACK CTextService::_MsgWndProc(HWND hWnd, UINT msg,
         }
         if (wParam == DSIME_PUMP_TIMER_ID) {
             self->_PumpQueue();
+            return 0;
+        }
+        if (wParam == DSIME_FLASH_TIMER_ID) {
+            // The Ctrl+Space notice has had its moment. Clear the flag and let
+            // the normal rule decide whether the box stays up — it will, if there
+            // is pinyin or a pending count behind the notice.
+            self->_modeFlash = false;
+            ::KillTimer(hWnd, DSIME_FLASH_TIMER_ID);
+            self->_UpdateInputBox();
             return 0;
         }
         return 0;

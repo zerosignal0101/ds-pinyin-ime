@@ -36,7 +36,9 @@ its own floating box, runs the conversion queue, and hosts the Settings UI.
 
 1. User types ASCII pinyin (plus apostrophe and punctuation) → frontend appends
    to its buffer and **draws it in a floating box**. The document is not touched:
-   no text is inserted, and no composition text is ever written.
+   no text is inserted, and no composition text is ever written. A letter typed
+   with **Shift** joins the buffer **upper-case**, which is how an abbreviation
+   survives the trip — see `CLAUDE.md`.
 2. **Nothing is converted while typing.** There is no debounce timer and no
    background request — the box shows exactly what was typed.
 3. Space snapshots the buffer and the caret into a queue entry, and the pinyin
@@ -52,7 +54,11 @@ its own floating box, runs the conversion queue, and hosts the Settings UI.
    `windows/README.md` for the shape this has to take in practice.
 5. Enter writes the raw buffer verbatim (no conversion); Esc discards what is
    being typed but leaves the queue running; Backspace edits the buffer.
-6. If a result cannot be written at all (document closed or read‑only), it goes
+6. **Ctrl+Space** toggles English mode, in which nothing is pinyin: every
+   printable key takes the same literal path as idle punctuation — queued behind
+   a sentence still in flight, handed to the host when the queue is empty. A
+   buffer in progress is flushed verbatim, not converted.
+7. If a result cannot be written at all (document closed or read‑only), it goes
    to the clipboard and the box says so. If the *conversion* fails, the raw
    pinyin is written instead — the same escape hatch Enter provides.
 
@@ -106,14 +112,20 @@ Structure (append‑only, which is what makes the provider's prefix cache hit):
 [user: 当前拼音]
 ```
 
-Windows are keyed by application (`{exe}|{window class}`), so every Chrome tab
-shares one context — the industry vocabulary being bought is a property of the
-application, not of a tab. Token accounting trusts the provider's `usage` and
-estimates only what was appended since; past
+Contexts are keyed `{exe}|{pid}` — per **process instance**. Keying on the window
+class instead pooled every Notepad3 window into one history, so a second file
+taught the model the first file's vocabulary and billed for it on every sentence;
+the pid separates the instances, which is as close to "which document" as a text
+service gets without reading the title. Token accounting trusts the provider's
+`usage` and estimates only what was appended since; past
 `context_window_tokens × context_compact_ratio` the history is summarised by a
 second model call, keeping the most recent `context_keep_recent` turns verbatim.
-Contexts are persisted beside the config file and loaded back trimmed to the
-current window, so shrinking the window does not leave oversized prompts behind.
+
+Nothing is persisted. A context is a record of document text; on disk it outlived
+the document it described while still being prepended to every request at token
+prices, and it left a copy of what the user typed lying around. Holding it in
+memory costs the history across a restart, and — because the engine is built per
+activation — across switching to another input method and back.
 
 ## Conversion prompt
 System prompt instructs the model to treat the user message as toneless Hanyu
@@ -157,9 +169,16 @@ a field the frontend omits is not preserved, it is reset to its default. Any new
 config field must therefore be surfaced in the Settings dialog or carried through
 it verbatim.
 
-The conversation contexts live in `%APPDATA%\DSInput\DSInput\context\` as one
-JSON file per window, so the config stays a settings file rather than a data
-store. `ds_engine_clear_contexts` is the way to be rid of them.
+The conversation contexts are held in memory by the engine, so the config stays a
+settings file rather than a data store. `ds_engine_clear_contexts` is the way to be
+rid of them, and it also deletes the per-window JSON an older version wrote under
+`%APPDATA%\DSInput\DSInput\context\` — nothing reads those any more, and a record
+of the user's typed text should not outlive the feature that made it.
+
+The system prompt has a related trap: it is *stored* in the config file, so editing
+its default in code reaches no existing install. `LEGACY_SYSTEM_PROMPTS` in
+`core/src/config.rs` lists the past defaults so `Config::load_or_create` can
+recognise a prompt the user never touched and upgrade it.
 
 ## Threading contract
 The result callback fires on a Tokio worker thread. The frontend MUST hop to the

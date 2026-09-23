@@ -9,6 +9,11 @@ pre-edit is the raw pinyin you entered; Space sends the whole buffer to the mode
 and writes the returned sentence straight into the document, in one step. Enter
 writes the raw buffer verbatim (no conversion), and Esc discards everything.
 
+Two keys do something else. **Shift+letter** keeps the letter upper-case, so
+`shiyongAI` reaches the model as an abbreviation and comes back as 使用AI instead
+of the model reading `ai` as pinyin — see "Case and abbreviations" below.
+**Ctrl+Space** switches between Chinese and English input.
+
 ## Prerequisites
 
 - **Visual Studio 2022** with the *Desktop development with C++* workload
@@ -151,15 +156,26 @@ is frontend state on purpose — see the note in `CLAUDE.md`.
   already "converted", so the pump hands them straight to the inserter and the
   model is never asked about them. That is the punctuation we own (written
   full-width), a space, a digit, any other printable character — everything the
-  host would otherwise have typed as text. They have to queue: a result is
-  inserted at *the selection as it stands when its turn comes* — the anchor only
-  decides where the composition is parked, and starting one moves the selection
-  there — so writing the comma on the spot moves the caret past it, and the
-  sentence still in flight then lands behind it. The user reads `，你好` for what
-  they meant as `你好，`. Taking a number also matches the intent: the character
-  belongs to the sentence just typed. `_IsKeyEaten` has to agree, since it decides
-  before `_HandleKey` ever runs. The box's 待转换 badge counts conversions only, so
-  a comma does not make it jump.
+  host would otherwise have typed as text — and every character typed in English
+  mode. They have to queue: a result is inserted at *the selection as it stands
+  when its turn comes* — the anchor only decides where the composition is parked,
+  and starting one moves the selection there — so writing the comma on the spot
+  moves the caret past it, and the sentence still in flight then lands behind it.
+  The user reads `，你好` for what they meant as `你好，`. Taking a number also
+  matches the intent: the character belongs to the sentence just typed.
+  `_IsKeyEaten` has to agree, since it decides before `_HandleKey` ever runs. The
+  box's 待转换 badge counts conversions only, so a comma does not make it jump.
+- **Consecutive literal characters merge into one job.** English mode produces
+  whole words, and one job per character would mean one anchor capture (a
+  synchronous edit session) and one inserted composition each, for text that lands
+  in exactly the same place. `_EnqueueIdleChar` appends to the literal job at the
+  tail instead. Two guards make that safe: `_jobs.size() > 1`, because the head is
+  the one the pump may be inserting, and a check that the tail job belongs to the
+  *same context* — a queued job outlives a focus change, so without it an alt-tab
+  mid-word would merge one document's characters into another's job.
+- **Literal jobs are not counted against `queue_max_pending`.** That bound exists
+  to limit model requests, which literals are not; the box's 待转换 count ignores
+  them for the same reason.
 - **Enter is the exception**, and stays with the host: it is as much a command as
   a character (a newline in an editor, *submit* in a search box). A line break
   typed while a sentence is converting therefore still lands in front of it.
@@ -191,9 +207,76 @@ is frontend state on purpose — see the note in `CLAUDE.md`.
   (document mid-edit) is retried on a timer; anything else falls back to the
   clipboard with a red badge in the box, and the HRESULT is appended to
   `%TEMP%\dsinput-error.log`.
+- **`TF_S_ASYNC` is retried, not accepted.** It is a *success* code
+  (`0x00040300`) meaning "queued", and `FAILED()` is false for it — so treating it
+  as done pops the job with the sentence unwritten, and no error, badge or trace
+  says so. It is grouped with `TF_E_LOCKED` on the retry timer, because both mean
+  the same thing here: nothing has been written yet. The compose step is also why
+  it must not be *interpreted*: a queued session has not produced the composition
+  handle yet, and reading that null as "this host refused" is what routed the
+  write into the non-notifying fallback — the sentence in the document and
+  invisible on screen. Asking for the session during a key event's **test phase**
+  is what makes TSF defer it; from a posted message the same call is granted
+  inline, which is why the flush posts `WM_DSIME_PUMP` instead of pumping inline.
 - Depth is bounded by `queue_max_pending`; past it, Space is swallowed rather
   than passed to the host (a literal space in the document would be worse).
 - A lost thread focus does **not** cancel the queue, only the typing session.
+
+### Case, and Chinese / English mode
+
+**Shift+letter keeps its case in the buffer.** The buffer is drawn in the box and
+sent to the model as typed, so `shiyongAI` converts to 使用AI; flattening it to
+`shiyongai` would leave the model no reason to prefer `AI` over 爱, because
+everything around it is pinyin. The case is taken from the **Shift key**, not from
+the character `ToUnicode` produced: with CapsLock on, the latter returns capitals
+for ordinary typing too, and every sentence would go to the model as `NIHAO` — the
+exact shape that is meant to mean "this is English". The consequence is that
+CapsLock+Shift yields a lower-case letter, which is Windows' own behaviour and the
+harmless direction to be wrong in.
+
+The prompt rule that goes with it is scoped to **runs of two or more** capitals: a
+single stray capital stays plausible pinyin, so a stuck Shift cannot quietly turn
+the IME into a way of writing English. The rule lives in the *config file*, not
+just in the code — see the note on `LEGACY_SYSTEM_PROMPTS` in `CLAUDE.md`.
+
+**Ctrl+Space toggles English mode, and it is handled in `OnTestKeyDown`** — the
+test phase, not the handle phase, and that is deliberate. With a composition live,
+the trace shows TSF calling `OnTestKeyDown`, this service answering "eaten", and
+`OnKeyDown` never arriving: a switch written in the handle phase therefore worked
+with an empty buffer and did nothing at all with a full one. The test callback is
+the only one delivered in both states, and real IMEs work there for the same
+reason — Weasel runs its whole key engine from `OnTestKeyDown` and leaves
+`OnKeyDown` to eat the key. `_ToggleEnglishMode` drops a repeat inside 200 ms, so
+hosts that reach both callbacks, or that send several tests for one press, cannot
+turn a single chord into two switches. Windows also binds this chord to
+"输入法/非输入法切换" — see Troubleshooting for what to do about that.
+
+English mode has no buffer at all: nothing typed is
+pinyin and nothing is remapped to full-width, so every printable key takes the
+literal path above. With a sentence still converting, the English queues behind it
+and lands in order; with the queue empty, `_IsKeyEaten` hands the key to the host
+and the application types it natively — which is what makes a whole sentence of
+English feel like nothing is installed. Space, Enter, Esc and Backspace likewise
+belong to the host in that mode (Esc deliberately does *not* leave the mode: a key
+that silently changes the input mode is worse than one that does nothing, and the
+box already says which mode is on).
+
+Ctrl+Space with a buffer in progress flushes it **verbatim**, as a literal job —
+not converted. The user is switching to English mid-word; spending a request to
+turn an unfinished fragment into Chinese is not what they asked for, and the queue
+is what makes it land after the sentences already owed to the document. If the
+anchor cannot be captured the buffer is left exactly as it is and the flush is
+retried at the top of the next keystroke (`_flushBufferAsLiteralDue`, the same
+idiom as `_reanchorDue`) — never written out of turn.
+
+The mode is per activation and not persisted. It is announced by a 中/英 marker on
+the box's status line, which also **flashes the box** for about a second when
+Ctrl+Space is pressed — that is its only feedback when there is nothing else to
+show, which is the case it is usually pressed in. The marker is drawn whenever the
+box is up; only the flash holds it open, or a panel would sit over the document
+for as long as the mode lasted. The flash uses **timer id 3**: `SetTimer` on an
+armed id replaces that timer, interval and all, so sharing the insert-retry id 2
+would let a mode change cancel a pending sentence.
 
 ### Floating input box
 `InputWindow.h/.cpp` — a `WS_POPUP | WS_DISABLED` window with
@@ -221,6 +304,13 @@ probe is a synchronous edit session, so `_UpdateInputBox(canProbeCaret)` is fals
 everywhere that runs from a TSF callback (a focus change, a composition torn down
 under us): those can run with the document locked, where a synchronous session is
 at best refused and at worst deadlocks.
+
+The line under the pinyin is the status line, and it is always there: it carries
+the 中/英 marker. `failed` outranks both the marker and the 待转换 count, because it
+is the only signal that text was lost and it is sticky until the next successful
+write — neither a mode marker nor a count may crowd it out. Its width is measured
+from the widest text it *can* hold rather than from the current one, or the box
+would twitch as a pending count went from 9 to 10.
 
 Repositioning is driven by `ITfTextLayoutSink::OnLayoutChange` plus a 150 ms timer
 for hosts that don't fire it (and for caret moves that change no text). Both are
@@ -280,6 +370,15 @@ One `DsEngine` per activation (shared, internally synchronized) and one
 - **The floating box is missing or in the wrong place** — the host doesn't
   implement `ITfContextView::GetTextExt`. Typing still works; the box falls back
   to the classic caret, then to the corner of the view. Nothing is ever lost.
+- **Ctrl+Space turns the IME off instead of switching to English** — a legacy
+  Windows hotkey has the chord, not us. Under *Settings ▸ Time & language ▸
+  Typing ▸ Advanced keyboard settings ▸ Input language hot keys*, open
+  "中文(简体，中国) — 输入法/非输入法切换" and **untick 「启用按键顺序」**. Do not try
+  to pick "Not Assigned" from the dropdown — there is no such entry, so the change
+  does not stick and the chord silently comes back on the next open. That hotkey is
+  handled by the input-language layer, below TSF, so the key never reaches the text
+  service at all: the trace shows a `deactivate` with no key event, which is also
+  why this IME cannot claim the chord back for itself.
 - **Nothing happens when I type pinyin** — the document is read-only, so
   `StartComposition` failed and the keys are deliberately being handed to the
   host.

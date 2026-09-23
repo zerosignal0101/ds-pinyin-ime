@@ -1,5 +1,5 @@
-//! Per-window conversation context: what the user has already written in the
-//! same input window, carried into the next conversion.
+//! Per-process conversation context: what the user has already written in this
+//! program instance, carried into the next conversion.
 //!
 //! The message array is **append-only** between compactions. That is the whole
 //! point: DeepSeek's context cache matches complete *prefix units*, so editing or
@@ -13,45 +13,47 @@
 //!   rewritten only when compaction runs, so it too is a stable prefix.
 //! * Token accounting is anchored on the provider's own `usage.prompt_tokens`
 //!   rather than a local tokenizer — see [`WindowContext::estimated_tokens`].
+//!
+//! The store is **in memory only**. It used to write one JSON file per window
+//! beside the config file, which had two costs that were not worth paying: the
+//! history outlived the document it described (and went on being prepended to
+//! every request, at token prices, however stale it was), and it left a copy of
+//! the user's typed text on disk forever. A context is worth having only for the
+//! session the user is actually in, and that is what this keeps.
 
 use crate::api;
 use crate::config::Config;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One converted sentence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Turn {
     pub pinyin: String,
     pub chinese: String,
 }
 
-/// The remembered state of one input window — also its on-disk shape.
+/// The remembered state of one program instance.
 ///
 /// A request works from a *clone* of this rather than a lock guard: the store's
 /// `MutexGuard` is not `Send`, and the request runs inside a spawned task that is
 /// awaited.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct WindowContext {
     /// Compacted note covering everything older than `turns`. Rewritten only by
     /// compaction; `None` until the first one runs.
-    #[serde(default)]
     pub summary: Option<String>,
-    #[serde(default)]
     pub turns: Vec<Turn>,
     /// Prompt tokens the provider reported for the last request that carried
     /// this context — the anchor the next estimate is built from.
-    #[serde(default)]
     pub last_prompt_tokens: u32,
     /// Completion tokens for that same request. The assistant's reply joins the
     /// history on the next turn, so it is part of what the next prompt costs.
-    #[serde(default)]
     pub last_completion_tokens: u32,
-    #[serde(default)]
+    /// When this window was last touched: the in-memory LRU clock that
+    /// `context_max_windows` evicts on. Nothing else reads it.
     pub updated_at: u64,
 }
 
@@ -121,115 +123,77 @@ impl WindowContext {
         self.last_completion_tokens = 0;
         self.updated_at = now_secs();
     }
-
-    /// Drop the oldest turns until the history fits the configured window.
-    ///
-    /// Run on load: lowering `context_window_tokens` must take effect, otherwise
-    /// a context file written under a larger budget would keep sending an
-    /// over-budget prompt forever.
-    pub fn truncate_to_window(&mut self, cfg: &Config) {
-        let budget = cfg.context_window_tokens.max(1);
-        // Walk from the front; each drop invalidates the usage anchor, so
-        // recompute the heuristic estimate after removing a turn.
-        while !self.turns.is_empty() && self.estimated_tokens_without_input(cfg) > budget {
-            self.turns.remove(0);
-            self.last_prompt_tokens = 0;
-            self.last_completion_tokens = 0;
-        }
-    }
-
-    fn estimated_tokens_without_input(&self, cfg: &Config) -> u32 {
-        self.estimated_tokens(cfg, "")
-    }
 }
 
-/// Remembered windows, persisted one file per window.
+/// Remembered program instances, in memory for the life of the engine.
+///
+/// Deliberately not persisted — see the module comment. The only thing this
+/// knows about a disk is how to clean up after the version that did persist.
 pub struct ContextStore {
-    /// `None` disables persistence (used by tests and by a core built without a
-    /// writable config directory).
-    dir: Option<PathBuf>,
     map: Mutex<HashMap<String, WindowContext>>,
-    /// Directory pruning runs once, lazily, on the first access.
-    pruned: AtomicBool,
+    /// Where a previous version kept its JSON, when this core was pointed at a
+    /// config file. Used *only* to delete those leftovers: nothing is ever
+    /// written here again, and the field is named to keep it that way.
+    legacy_dir: Option<PathBuf>,
 }
 
 impl ContextStore {
-    pub fn new(dir: Option<PathBuf>) -> ContextStore {
+    pub fn new(legacy_dir: Option<PathBuf>) -> ContextStore {
         ContextStore {
-            dir,
             map: Mutex::new(HashMap::new()),
-            pruned: AtomicBool::new(false),
+            legacy_dir,
         }
     }
 
-    /// A copy of a window's context. Unknown windows start empty; a window whose
-    /// file exists is loaded (and trimmed to the current window size) on first
-    /// use.
+    /// A copy of a window's context. Unknown windows — including every window on
+    /// a fresh engine — start empty.
     pub fn snapshot(&self, key: &str, cfg: &Config) -> WindowContext {
         let mut map = self.map.lock().unwrap();
         if !map.contains_key(key) {
-            let mut ctx = self.load(key);
-            ctx.truncate_to_window(cfg);
             self.evict_if_needed(&mut map, cfg);
-            map.insert(key.to_string(), ctx);
+            map.insert(key.to_string(), WindowContext::default());
         }
         map.get(key).cloned().unwrap_or_default()
     }
 
-    /// Apply `f` to a window's context, persist the result, and return whatever
-    /// `f` produced.
+    /// Apply `f` to a window's context and return whatever `f` produced.
     pub fn update<R>(&self, key: &str, cfg: &Config, f: impl FnOnce(&mut WindowContext) -> R) -> R {
-        self.prune_dir_once(cfg);
         let mut map = self.map.lock().unwrap();
         if !map.contains_key(key) {
-            let mut ctx = self.load(key);
-            ctx.truncate_to_window(cfg);
             self.evict_if_needed(&mut map, cfg);
-            map.insert(key.to_string(), ctx);
+            map.insert(key.to_string(), WindowContext::default());
         }
         let ctx = map.get_mut(key).expect("just inserted");
         let out = f(ctx);
         ctx.updated_at = now_secs();
-        if let Some(dir) = &self.dir {
-            let path = dir.join(file_name_for(key));
-            if let Err(e) = write_json(&path, ctx) {
-                // A context that cannot be persisted is still perfectly usable
-                // in memory — never let a disk problem break typing.
-                let _ = e;
-            }
-        }
         out
     }
 
-    /// Forget every window, on disk and in memory — Settings' "clear contexts".
+    /// Forget every window — Settings' "clear contexts".
     ///
     /// The context is a record of what the user has typed, so there has to be a
-    /// way to get rid of it that does not involve hunting for files.
+    /// way to be rid of it that does not involve hunting for files. What a
+    /// previous version wrote counts as part of "it", so this deletes that too.
     pub fn clear_all(&self) {
         self.map.lock().unwrap().clear();
-        let Some(dir) = &self.dir else { return };
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|x| x == "json") {
-                let _ = std::fs::remove_file(entry.path());
-            }
+        if let Some(dir) = &self.legacy_dir {
+            purge_legacy_files(dir);
         }
     }
 
-    fn load(&self, key: &str) -> WindowContext {
-        let Some(dir) = &self.dir else {
-            return WindowContext::default();
-        };
-        let path = dir.join(file_name_for(key));
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+    /// Delete what a previous version left on disk.
+    ///
+    /// The store no longer writes anything, but an install that has run an older
+    /// build still has a directory of the user's typed text under `%APPDATA%`.
+    /// Leaving it there would make "nothing is written to disk" false on exactly
+    /// the machines that have been used. Cheap and idempotent: once the files are
+    /// gone this is a failed `read_dir` on a missing path.
+    pub fn purge_legacy_dir(&self) {
+        let Some(dir) = &self.legacy_dir else { return };
+        purge_legacy_files(dir);
     }
 
-    /// Keep the in-memory map within `context_max_windows`, oldest first.
+    /// Keep the map within `context_max_windows`, oldest first.
     fn evict_if_needed(&self, map: &mut HashMap<String, WindowContext>, cfg: &Config) {
         let cap = cfg.context_max_windows.max(1) as usize;
         while map.len() >= cap {
@@ -241,78 +205,54 @@ impl ContextStore {
                 break;
             };
             map.remove(&oldest);
-            if let Some(dir) = &self.dir {
-                let _ = std::fs::remove_file(dir.join(file_name_for(&oldest)));
-            }
         }
     }
 
-    /// Bound the number of context files on disk. Runs once per process, before
-    /// the first write, so growth is capped without a directory scan per
-    /// conversion.
-    fn prune_dir_once(&self, cfg: &Config) {
-        if self.pruned.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let Some(dir) = &self.dir else { return };
-        let cap = cfg.context_max_windows.max(1) as usize;
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        let mut files: Vec<(SystemTime, PathBuf)> = entries
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .filter_map(|e| {
-                let modified = e.metadata().ok()?.modified().ok()?;
-                Some((modified, e.path()))
-            })
-            .collect();
-        if files.len() <= cap {
-            return;
-        }
-        files.sort_by_key(|(t, _)| *t);
-        for (_, path) in files.drain(..files.len() - cap) {
+    /// Test-only: is this key remembered? Unlike `snapshot`, asking does not
+    /// create the entry it asks about.
+    #[cfg(test)]
+    fn contains(&self, key: &str) -> bool {
+        self.map.lock().unwrap().contains_key(key)
+    }
+}
+
+/// Delete the files a previous version of this store wrote, best effort.
+fn purge_legacy_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_legacy_context_file(&path) {
             let _ = std::fs::remove_file(path);
         }
     }
+    // Only take the directory itself once nothing is left in it. `remove_dir`
+    // refuses a non-empty one, which is the check we want.
+    let _ = std::fs::remove_dir(dir);
 }
 
-fn write_json(path: &Path, ctx: &WindowContext) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string(ctx)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    std::fs::write(path, json)
-}
-
-/// A stable, filesystem-safe name for a window key.
+/// Is this a file the previous version wrote?
 ///
-/// The readable prefix keeps the directory browsable ("code_exe_Chrome_Widget…");
-/// the hash suffix makes it collision-free and stable no matter how the prefix
-/// was truncated.
-fn file_name_for(key: &str) -> String {
-    let mut safe: String = key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    safe.truncate(48); // ASCII-only, so this is a char-boundary-safe truncation
-    format!("{safe}-{:016x}.json", fnv1a(key))
-}
-
-fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+/// The filter is load-bearing, not tidiness. The core is pointed at an arbitrary
+/// config path by the CLI example and by tests, so an unfiltered `*.json` sweep
+/// would delete a stranger's data from whatever directory it was handed. Only the
+/// exact name shape `file_name_for` produced counts: `{prefix}-{16 hex}.json`,
+/// where the hash was a 64-bit FNV-1a rendered in lower-case.
+fn is_legacy_context_file(path: &Path) -> bool {
+    if path.extension().is_none_or(|e| e != "json") {
+        return false;
     }
-    h
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let Some((_, hash)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    hash.len() == 16
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn now_secs() -> u64 {
@@ -343,11 +283,25 @@ pub fn estimate_tokens(s: &str) -> u32 {
 mod tests {
     use super::*;
 
+    /// The exact name shape the previous version wrote: a readable prefix, a
+    /// '-', 16 lower-case hex, `.json`. Spelled out rather than generated,
+    /// because it is a contract with a build that no longer exists here.
+    const LEGACY_NAME: &str = "code_exe_Chrome_WidgetWin_1-0123456789abcdef.json";
+
     fn turn(p: &str, c: &str) -> Turn {
         Turn {
             pinyin: p.to_string(),
             chinese: c.to_string(),
         }
+    }
+
+    /// A temp directory unique to one test. Each test gets its own name because
+    /// they run in parallel threads of a single process, so pid alone collides.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dsime-ctx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -417,34 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_honours_a_lowered_window() {
-        // Small enough to bite, but comfortably above the system prompt — which
-        // is always sent and cannot be trimmed away.
-        let cfg = Config {
-            context_window_tokens: 400,
-            ..Config::default()
-        };
-        assert!(
-            WindowContext::default().estimated_tokens_without_input(&cfg) < 400,
-            "the test window must leave room for at least one turn"
-        );
-
-        let mut ctx = WindowContext {
-            turns: (0..200)
-                .map(|_| turn("nihaoshijie", "你好世界我是一个程序员"))
-                .collect(),
-            ..Default::default()
-        };
-        assert!(ctx.estimated_tokens_without_input(&cfg) > 400);
-
-        ctx.truncate_to_window(&cfg);
-        assert!(ctx.estimated_tokens_without_input(&cfg) <= 400);
-        // It drops from the front, so the newest turns are what survives.
-        assert!(!ctx.turns.is_empty());
-        assert!(ctx.turns.len() < 200);
-    }
-
-    #[test]
     fn needs_compaction_fires_at_the_ratio() {
         let cfg = Config {
             context_window_tokens: 1000,
@@ -478,46 +404,98 @@ mod tests {
     }
 
     #[test]
-    fn store_round_trips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("dsime-ctx-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_fresh_store_does_not_see_an_older_one() {
+        // What a restart looks like now, and the direct assertion that history
+        // is no longer carried across one.
         let cfg = Config::default();
-        let key = "code.exe|Chrome_WidgetWin_1";
+        let first = ContextStore::new(None);
+        first.update("code.exe|1234", &cfg, |c| {
+            c.record("nihaoshijie", "你好世界", api::Usage::default())
+        });
+        assert_eq!(first.snapshot("code.exe|1234", &cfg).turns.len(), 1);
 
-        {
-            let store = ContextStore::new(Some(dir.clone()));
-            store.update(key, &cfg, |c| {
-                c.record("nihaoshijie", "你好世界", api::Usage::default())
-            });
-        }
-        // A fresh store (as after a restart) must find it again.
+        let second = ContextStore::new(None);
+        assert!(second.snapshot("code.exe|1234", &cfg).turns.is_empty());
+    }
+
+    #[test]
+    fn eviction_honours_context_max_windows() {
+        let cfg = Config {
+            context_max_windows: 2,
+            ..Config::default()
+        };
+        let store = ContextStore::new(None);
+
+        // A window that was read but never recorded keeps `updated_at == 0`, so
+        // it is the one eviction must pick. (`update` stamps from the clock,
+        // whose one-second resolution cannot order three entries in a test.)
+        store.snapshot("never-recorded", &cfg);
+        store.update("fresh", &cfg, |c| c.record("p", "c", api::Usage::default()));
+        store.update("newest", &cfg, |c| {
+            c.record("p", "c", api::Usage::default())
+        });
+
+        assert!(store.contains("fresh"));
+        assert!(store.contains("newest"));
+        assert!(!store.contains("never-recorded"), "the oldest must go");
+    }
+
+    #[test]
+    fn clear_all_forgets_every_window() {
+        let cfg = Config::default();
+        let store = ContextStore::new(None);
+        store.update("a.exe|1", &cfg, |c| {
+            c.record("p", "c", api::Usage::default())
+        });
+        store.clear_all();
+        assert!(!store.contains("a.exe|1"));
+    }
+
+    #[test]
+    fn clear_all_deletes_legacy_files_and_leaves_foreign_ones() {
+        let dir = temp_dir("purge");
+        std::fs::write(dir.join(LEGACY_NAME), b"{}").unwrap();
+        // Not ours, and this is the point of the filter: the core is pointed at
+        // arbitrary config directories by the CLI and by tests.
+        std::fs::write(dir.join("notes.json"), b"someone else's").unwrap();
+        std::fs::write(dir.join("thing-abc.json"), b"{}").unwrap();
+        std::fs::write(dir.join("keep.txt"), b"not json").unwrap();
+
         let store = ContextStore::new(Some(dir.clone()));
-        let snap = store.snapshot(key, &cfg);
-        assert_eq!(snap.turns.len(), 1);
-        assert_eq!(snap.turns[0].chinese, "你好世界");
+        store.clear_all();
 
-        // An unrelated key stays empty rather than sharing the file.
-        assert!(store.snapshot("other.exe|Edit", &cfg).turns.is_empty());
+        assert!(
+            !dir.join(LEGACY_NAME).exists(),
+            "our own file should be gone"
+        );
+        assert!(dir.join("notes.json").exists());
+        assert!(dir.join("thing-abc.json").exists());
+        assert!(dir.join("keep.txt").exists());
+        // Still occupied by someone else, so the directory itself stays.
+        assert!(dir.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn store_survives_an_unwritable_directory() {
-        // Persistence is best-effort: a bad path must not lose the in-memory
-        // context or panic.
-        let store = ContextStore::new(Some(PathBuf::from("\0invalid")));
-        let cfg = Config::default();
-        store.update("k", &cfg, |c| c.record("p", "c", api::Usage::default()));
-        assert_eq!(store.snapshot("k", &cfg).turns.len(), 1);
+    fn the_startup_purge_takes_the_emptied_directory_too() {
+        let dir = temp_dir("purge-once");
+        std::fs::write(dir.join(LEGACY_NAME), b"{}").unwrap();
+
+        ContextStore::new(Some(dir.clone())).purge_legacy_dir();
+        assert!(!dir.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn file_names_are_distinct_and_bounded() {
-        let a = file_name_for("code.exe|Chrome_WidgetWin_1");
-        let b = file_name_for("code.exe|Chrome_WidgetWin_2");
-        assert_ne!(a, b);
-        assert!(a.len() <= 48 + 1 + 16 + 5);
-        assert!(a.ends_with(".json"));
+    fn the_startup_purge_is_harmless_without_a_directory() {
+        // The engine is built with no config parent in some embeddings, and the
+        // directory is absent after the first purge. Neither may panic.
+        ContextStore::new(None).purge_legacy_dir();
+        let dir = temp_dir("purge-absent");
+        std::fs::remove_dir_all(&dir).unwrap();
+        ContextStore::new(Some(dir.clone())).purge_legacy_dir();
+        assert!(!dir.exists());
     }
 }

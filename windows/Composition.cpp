@@ -194,7 +194,13 @@ void CTextService::_UpdateInputBox(bool canProbeCaret) {
         _inputBox->Hide();
         return;
     }
-    if (_pinyin.empty() && _PendingConversions() == 0 && !_writeFailed) {
+    // `_modeFlash` is the exception: Ctrl+Space asked for the box to show the new
+    // mode even though there is nothing else to put in it. Mirrors the same test
+    // in DSInputBoxWnd::_ShowOrHide — the two are separate copies on purpose (the
+    // box is presentation and this is the state), but they must agree, and a
+    // state added to one without the other shows up as a box that will not go
+    // away or a flash that never appears.
+    if (_pinyin.empty() && _PendingConversions() == 0 && !_writeFailed && !_modeFlash) {
         // Idle. Skip the caret probe below — that is a synchronous edit session,
         // and the layout timer would otherwise run one six times a second for
         // nothing.
@@ -202,11 +208,13 @@ void CTextService::_UpdateInputBox(bool canProbeCaret) {
         _inputBox->Hide();
         return;
     }
-    DsimeTrace(L"box: show pinyin=%u pending=%u jobs=%u failed=%d composing=%d",
+    DsimeTrace(L"box: show pinyin=%u pending=%u jobs=%u failed=%d composing=%d english=%d "
+               L"flash=%d",
                static_cast<unsigned>(_pinyin.size()),
                static_cast<unsigned>(_PendingConversions()),
                static_cast<unsigned>(_jobs.size()),
-               static_cast<int>(_writeFailed), static_cast<int>(_composing));
+               static_cast<int>(_writeFailed), static_cast<int>(_composing),
+               static_cast<int>(_englishMode), static_cast<int>(_modeFlash));
 
     // Anchor first: SetContent triggers a layout, and laying out against a stale
     // caret would visibly jump before correcting itself.
@@ -222,6 +230,9 @@ void CTextService::_UpdateInputBox(bool canProbeCaret) {
         }
     }
 
+    // Mode before content: SetContent can hide the box, and SetMode can bring it
+    // back, so doing it the other way round would flash a stale frame.
+    _inputBox->SetMode(_englishMode, _modeFlash);
     _inputBox->SetContent(dsime::Utf8ToUtf16(_pinyin),
                           static_cast<unsigned>(_PendingConversions()), _writeFailed);
 }
@@ -245,14 +256,22 @@ std::string CTextService::_ContextKeyForFocus() {
     pdim->Release();
     if (!hwnd) return std::string();
 
-    // {exe}|{window class}. Deliberately application-level rather than per
-    // window: the domain vocabulary the context buys us is a property of the
-    // application, and keying on the title would restart from nothing on every
-    // new browser tab.
+    // {exe}|{pid}.
+    //
+    // Per *process*, not per window and not per window class. Keying on the class
+    // was the bug: every Notepad3 window shares one, so opening a second file in
+    // a second Notepad3 taught the model the first file's vocabulary and billed
+    // the user for it on every sentence. The pid separates the instances, which
+    // is the closest a text service can get to "which document" without reading
+    // the title — and the title would restart from nothing on every browser tab.
+    //
+    // Note the granularity it does NOT give: one process is one context, so
+    // Electron and VS Code still share across their windows. That is accepted.
     wchar_t exe[MAX_PATH] = {};
     DWORD pid = 0;
     ::GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != 0) {
+    if (pid == 0) return std::string();  // no window, no identity: no context
+    {
         HANDLE hProc = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (hProc) {
             DWORD n = ARRAYSIZE(exe);
@@ -264,16 +283,17 @@ std::string CTextService::_ContextKeyForFocus() {
     const size_t slash = exeName.find_last_of(L"\\/");
     if (slash != std::wstring::npos) exeName = exeName.substr(slash + 1);
 
-    wchar_t cls[256] = {};
-    ::GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
-
+    // From here on the run is never computed. The engine holds one context store
+    // per process already, so it cannot collide across processes; the pid is in
+    // the key to keep it readable in traces and to keep an exe name we could not
+    // read ("unknown") from merging two unrelated programs.
     std::string key = dsime::Utf16ToUtf8(exeName);
     for (char& c : key) {
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     }
     if (key.empty()) key = "unknown";
     key += '|';
-    key += dsime::Utf16ToUtf8(std::wstring(cls));
+    key += std::to_string(pid);
     return key;
 }
 
@@ -411,13 +431,26 @@ bool CTextService::_FinishJob(PendingJob* job) {
     // _ReanchorIfComposing is a no-op when nothing is being typed.
     _reanchorDue = true;
 
-    if (hr == TF_E_LOCKED && job->insertRetries < DSIME_MAX_INSERT_RETRIES) {
-        // The document is mid-edit. Wait rather than losing the sentence.
+    // A refused session (TF_E_LOCKED: the document is mid-edit) and a queued one
+    // (TF_S_ASYNC: TSF took it but has not run it) mean the same thing to us —
+    // nothing has been written yet. Wait and retry rather than accepting the
+    // result.
+    //
+    // TF_S_ASYNC is a *success* code, so accepting it here is the quiet failure:
+    // FAILED() is false, the job is popped, and the sentence is gone with no
+    // error and no badge. That is why it is listed explicitly.
+    const bool retryable = (hr == TF_E_LOCKED || hr == TF_S_ASYNC);
+    if (retryable && job->insertRetries < DSIME_MAX_INSERT_RETRIES) {
         ++job->insertRetries;
         if (_msgWnd) ::SetTimer(_msgWnd, DSIME_PUMP_TIMER_ID, DSIME_PUMP_TIMER_MS, nullptr);
         return false;
     }
-    if (FAILED(hr)) {
+    if (FAILED(hr) || retryable) {
+        // Out of retries with nothing written, or the document refused. Same
+        // treatment either way: the sentence goes to the clipboard and the box
+        // says so, because dropping it silently is the one outcome the queue
+        // exists to prevent. (The retryable codes are not FAILED, so without the
+        // second test this case fell straight through to "success".)
         _LoseText(text, hr);
         return true;
     }

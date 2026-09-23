@@ -38,10 +38,15 @@ const COLORREF kText = RGB(28, 28, 28);
 const COLORREF kBadge = RGB(120, 120, 120);
 const COLORREF kBadgeBad = RGB(200, 40, 40);
 
-// "待转换 " — spelled as escapes because the MSVC build here does not pass
-// /utf-8, so a literal would depend on the source file's encoding.
-const wchar_t kPendingPrefix[] = L"待转换 ";             // 待转换
-const wchar_t kFailedBadge[] = L"已复制到剪贴板";  // 已复制到剪贴板
+// Spelled as \uXXXX escapes on purpose. The build passes no /utf-8 and the
+// sources carry no BOM, so a literal here would be decoded with whatever ANSI
+// code page the *build machine* happens to use — correct today only because this
+// one is set to UTF-8 (65001), and mojibake on any other. Escapes do not care.
+const wchar_t kPendingPrefix[] = L"\u5F85\u8F6C\u6362 ";  // 待转换
+const wchar_t kFailedBadge[] = L"\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F";  // 已复制到剪贴板
+const wchar_t kChineseBadge[] = L"\u4E2D\u6587";  // 中文
+const wchar_t kEnglishBadge[] = L"\u82F1\u6587";  // 英文
+const wchar_t kBadgeSep[] = L" \u00B7 ";  // " · "
 
 // user32!GetDpiForWindow (Windows 10 1607+), resolved lazily so the DLL still
 // loads on older systems — where 96 is the right answer anyway.
@@ -146,19 +151,53 @@ void DSInputBoxWnd::SetContent(const std::wstring& pinyin, unsigned pending,
     _pinyin = pinyin;
     _pending = pending;
     _failed = failed;
+    _ShowOrHide();
+}
 
-    // Nothing being typed and nothing outstanding: there is no box to show.
+void DSInputBoxWnd::SetMode(bool english, bool flash) {
+    if (_english == english && _flash == flash) return;
+    _english = english;
+    _flash = flash;
+    _ShowOrHide();
+}
+
+void DSInputBoxWnd::_ShowOrHide() {
+    // Nothing being typed, nothing outstanding, nothing to announce: there is no
+    // box to show.
     //
-    // `failed` is an exception and must be tested here. "No pinyin, nothing
-    // pending, something went wrong" is exactly the shape of the clipboard
-    // fallback — the one state where the badge is the entire message. Hiding on
-    // this test would swallow the only signal the user gets that a sentence did
-    // not reach the document.
-    if (_pinyin.empty() && _pending == 0 && !_failed) {
+    // Two states are exceptions, and both have to be tested here because each is
+    // the one case where the status line is the entire message:
+    //   * `_failed` — the clipboard fallback. Hiding would swallow the only
+    //     signal the user gets that a sentence did not reach the document.
+    //   * `_flash`  — Ctrl+Space's mode notice, and Ctrl+Space is most often
+    //     pressed with nothing on screen at all, which is the whole reason it
+    //     announces itself. The caller's timer takes it back down.
+    if (_pinyin.empty() && _pending == 0 && !_failed && !_flash) {
         Hide();
         return;
     }
     _Relayout();
+}
+
+// The status line under the pinyin.
+//
+// `failed` stands alone and wins. It is the only signal that text was lost, and
+// it is sticky until the next successful write, so neither the mode marker nor a
+// count may crowd it out.
+std::wstring DSInputBoxWnd::_StatusText() const {
+    if (_failed) return std::wstring(kFailedBadge);
+
+    // The mode is always there. Which language the next key produces is the one
+    // thing about this box that has no other cue on screen.
+    std::wstring text = _english ? kEnglishBadge : kChineseBadge;
+    if (_pending > 0) {
+        wchar_t num[16] = {};
+        ::wsprintfW(num, L"%u", _pending);
+        text += kBadgeSep;
+        text += kPendingPrefix;
+        text += num;
+    }
+    return text;
 }
 
 void DSInputBoxWnd::Hide() {
@@ -200,7 +239,11 @@ void DSInputBoxWnd::_LineHeights(HDC dc, int* outPinyinH, int* outBadgeH) const 
         ::SelectObject(dc, old);
         *outPinyinH = static_cast<int>(tm.tmHeight);
     }
-    if (_failed || _pending > 0) {
+    // Unconditional, because the status line always carries the mode marker:
+    // whenever the box is up, this line is on it. _MeasureContent and _Repaint
+    // both take the height from here, which is what keeps the two from disagreeing
+    // about how tall the box is.
+    {
         HGDIOBJ old = ::SelectObject(dc, _smallFont);
         TEXTMETRICW tm = {};
         ::GetTextMetricsW(dc, &tm);
@@ -271,15 +314,11 @@ void DSInputBoxWnd::_Repaint() {
         y += pinyinH + Scaled(kBadgeGap, _dpi);
     }
 
-    if (_failed || _pending > 0) {
-        std::wstring badge;
-        if (_failed) {
-            badge = kFailedBadge;
-        } else {
-            wchar_t num[16] = {};
-            ::wsprintfW(num, L"%u", _pending);
-            badge = std::wstring(kPendingPrefix) + num;
-        }
+    // Always drawn, and always at the full height _LineHeights reserved for it.
+    // The mode marker lives here, so there is never a box without this line; the
+    // red text is the only thing that varies.
+    {
+        const std::wstring badge = _StatusText();
         HGDIOBJ oldFont = ::SelectObject(mem, _smallFont);
         ::SetTextColor(mem, _failed ? kBadgeBad : kBadge);
         RECT line = {padX, y, w - padX, y + badgeH};
@@ -322,9 +361,14 @@ void DSInputBoxWnd::_MeasureContent(int dpi, int* outW, int* outH) {
         h += pinyinH;
     }
 
-    if (_failed || _pending > 0) {
-        // Measured generously: the real badge text is built in _Repaint. Its
-        // widest form is bounded by the failure message, so measure that.
+    {
+        // Always present, since the status line carries the mode marker.
+        //
+        // Measured generously rather than from _StatusText(): the width would then
+        // change with the pending count and the box would twitch as a digit went
+        // from 9 to 10. The failure message is the widest thing this line ever
+        // holds — the mode marker plus a count is shorter — so measuring that
+        // bounds it, and DT_END_ELLIPSIS covers the rest.
         HGDIOBJ old = ::SelectObject(dc, _smallFont);
         SIZE sz = {};
         ::GetTextExtentPoint32W(dc, kFailedBadge,

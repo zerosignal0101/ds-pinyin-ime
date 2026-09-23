@@ -42,8 +42,8 @@ BEGIN
 
     GROUPBOX        "Context",          -1,            10, 240, 300, 100
 
-    CONTROL         "Remember what is typed, per window", IDC_CONTEXT_ENABLED,
-                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 20, 254, 200, 10
+    CONTROL         "Remember what is typed, per program instance", IDC_CONTEXT_ENABLED,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 20, 254, 230, 10
 
     LTEXT           "Window tokens:",   -1,            20, 272,  60, 10
     EDITTEXT                            IDC_CONTEXT_WINDOW_TOKENS, 84, 270, 50, 12,
@@ -57,7 +57,7 @@ BEGIN
                     ES_AUTOHSCROLL | ES_NUMBER
 
     PUSHBUTTON      "Clear stored context", IDC_CLEAR_CONTEXT, 20, 310, 110, 14
-    LTEXT           "Context records what you type, including\na copy on disk. Clearing it cannot be undone.",
+    LTEXT           "Context records what you type, in memory\nonly. Clearing it cannot be undone.",
                     -1, 138, 306, 166, 22
 
     LTEXT           "",                 IDC_CONFIG_PATH, 10, 344, 300, 10

@@ -47,12 +47,17 @@ wchar_t VkToChar(WPARAM vk, LPARAM /*lParam*/) {
     return 0;
 }
 
-// Modifier keys held? We only want bare keys (no Ctrl/Alt) to feed the buffer,
-// so Ctrl+C etc. always pass through to the app.
-bool CtrlOrAltDown() {
-    return (::GetKeyState(VK_CONTROL) & 0x8000) ||
-           (::GetKeyState(VK_MENU) & 0x8000);
-}
+// Modifier state as of the key event being handled. GetKeyState, never
+// GetAsyncKeyState: the async call reads the hardware live, so releasing Shift
+// while its own key is still being processed would change the answer underneath
+// us. These agree with the GetKeyboardState VkToChar uses.
+bool CtrlDown()  { return (::GetKeyState(VK_CONTROL) & 0x8000) != 0; }
+bool AltDown()   { return (::GetKeyState(VK_MENU) & 0x8000) != 0; }
+bool ShiftDown() { return (::GetKeyState(VK_SHIFT) & 0x8000) != 0; }
+
+// We only want bare keys (no Ctrl/Alt) to feed the buffer, so Ctrl+C etc. always
+// pass through to the app.
+bool CtrlOrAltDown() { return CtrlDown() || AltDown(); }
 
 // Map an ASCII punctuation char to its full-width (全角) equivalent, or 0 if it
 // isn't one we remap. \uXXXX escapes keep this independent of the source-file
@@ -72,6 +77,19 @@ wchar_t FullWidthPunct(wchar_t ch) {
     }
 }
 
+// The two kinds of key we own while typing pinyin: the buffer's alphabet, and
+// the punctuation we render full-width. English mode owns neither — that IS the
+// mode — so both the decision phase (_IsKeyEaten, which must not claim a key the
+// handler will not act on) and the handling phase (_HandleKey) ask through these
+// rather than each testing the flag for itself and drifting apart.
+bool IsPinyinKey(bool english, WPARAM vk, wchar_t ch) {
+    return !english && IsPinyinChar(vk, ch);
+}
+
+bool IsFullWidthKey(bool english, wchar_t ch) {
+    return !english && FullWidthPunct(ch) != 0;
+}
+
 }  // namespace
 
 // ---- ITfKeyEventSink::OnSetFocus (foreground/background) -------------------
@@ -85,6 +103,26 @@ STDMETHODIMP CTextService::OnSetFocus(BOOL /*fForeground*/) {
 // ---- decision: would we eat this key? --------------------------------------
 
 BOOL CTextService::_IsKeyEaten(ITfContext* /*pic*/, WPARAM wParam, LPARAM lParam) {
+    // Every Space is logged, which is what tells the two ways Ctrl+Space can fail
+    // apart. A line here with ctrl=1 means the chord reached the text service and
+    // the fault is ours. No line at all for Ctrl+Space, while a plain Space still
+    // logs, means the key never arrived — and the usual cause is that it is not
+    // ours to receive: Windows binds "输入法/非输入法切换" to Ctrl+Space per
+    // language, handles it below TSF, and answers by switching the language out of
+    // the IME and back. The giveaway in the log is a "deactivate" with no key line
+    // before it.
+    if (wParam == VK_SPACE) {
+        DsimeTrace(L"test: space ctrl=%d alt=%d shift=%d english=%d",
+                   static_cast<int>(CtrlDown()), static_cast<int>(AltDown()),
+                   static_cast<int>(ShiftDown()), static_cast<int>(_englishMode));
+    }
+
+    // Ctrl+Space toggles Chinese/English, and it has to be claimed BEFORE the
+    // modifier early-out below — that early-out is exactly why the chord reaches
+    // the host today. Alt must be up: on several layouts AltGr reports as
+    // Ctrl+Alt, and Ctrl+Shift+Space belongs to the app. Shift is allowed.
+    if (wParam == VK_SPACE && CtrlDown() && !AltDown()) return TRUE;
+
     // Never intercept while a modifier is down — let shortcuts through.
     if (CtrlOrAltDown()) return FALSE;
 
@@ -108,17 +146,25 @@ BOOL CTextService::_IsKeyEaten(ITfContext* /*pic*/, WPARAM wParam, LPARAM lParam
 
     wchar_t ch = VkToChar(wParam, lParam);
     // Any bare a-z / apostrophe feeds the buffer. Shift is deliberately not
-    // excluded: a capital mid-buffer should extend what is being typed rather
-    // than strand the buffer.
-    if (IsPinyinChar(wParam, ch)) return TRUE;
+    // excluded: a capital typed mid-buffer extends what is being typed rather
+    // than stranding the buffer, and it is kept as a capital — see the mapping in
+    // _HandleKey, which is what lets "shiyongAI" come back as 使用AI.
+    if (IsPinyinKey(_englishMode, wParam, ch)) return TRUE;
     // Punctuation is ours too: appended to the buffer while typing, emitted as
     // its full-width (全角) form when idle.
-    if (FullWidthPunct(ch) != 0) return TRUE;
-    // Any other printable character is ours *while sentences are still owed to
-    // this document*, because it has to take its turn behind them rather than
-    // land in front. With an empty queue the host handles it, which is both
-    // correct and cheaper.
-    if (!_jobs.empty() && ch >= 0x20 && ch != 0x7F) return TRUE;
+    if (IsFullWidthKey(_englishMode, ch)) return TRUE;
+    // Any other printable character is ours while there is something for it to
+    // belong to. Two such things:
+    //   * a live buffer, which it extends — a digit or a '+' in the middle of
+    //     pinyin is part of the sentence (see the mapping in _HandleKey, which
+    //     has to agree or the host would type it and the buffer never see it);
+    //   * sentences still owed to this document, because it has to take its turn
+    //     behind them rather than land in front.
+    // With neither, the host handles it, which is both correct and cheaper. In
+    // English mode this clause is the whole story: it is what queues a word
+    // behind a sentence still converting, and what lets the host type it
+    // natively when nothing is pending.
+    if ((_composing || !_jobs.empty()) && ch >= 0x20 && ch != 0x7F) return TRUE;
     return FALSE;
 }
 
@@ -126,10 +172,40 @@ BOOL CTextService::_IsKeyEaten(ITfContext* /*pic*/, WPARAM wParam, LPARAM lParam
 
 STDMETHODIMP CTextService::OnTestKeyDown(ITfContext* pic, WPARAM wParam, LPARAM lParam,
                                    BOOL* pfEaten) {
-    // Note: no caret probe here. This runs on every keystroke and must stay free
-    // of side effects — repositioning the box is done from the layout sink and
-    // the layout timer instead.
+    // No caret probe here: this runs on every keystroke and must stay free of
+    // side effects — repositioning the box is done from the layout sink and the
+    // layout timer instead.
     *pfEaten = _IsKeyEaten(pic, wParam, lParam);
+
+    // Ctrl+Space is switched HERE, in the test phase, and that is a deliberate
+    // exception to "a test has no side effects".
+    //
+    // The trace from Notepad3 says why. With a composition live — which is to
+    // say, whenever there is pinyin to flush, the only case where this key does
+    // anything — TSF calls OnTestKeyDown, this service answers "eaten", and
+    // OnKeyDown is never called. An ordinary Space gets both callbacks; a
+    // Ctrl+Space with a buffer gets one. So a handler in OnKeyDown switched the
+    // mode with an empty buffer and silently did nothing with a full one.
+    //
+    // Registering the chord as a preserved key — the documented answer — is
+    // worse: it takes the key at the test stage for good, while OnPreservedKey is
+    // delivered from that same missing handle phase. The chord went completely
+    // dead, `hr=00000000` and not one callback afterwards.
+    //
+    // So this is the only callback the host delivers in both states, and the work
+    // happens here. Weasel does the same thing for the same class of host
+    // misbehaviour — its OnTestKeyDown runs the engine and the composition update
+    // while its OnKeyDown only eats the key — so this is a known-good shape for a
+    // Windows IME rather than a liberty.
+    //
+    // _ToggleEnglishMode drops a repeat inside 200 ms, which is what makes it
+    // safe here: the hosts that DO reach OnKeyDown, and the ones that call
+    // OnTestKeyDown more than once for a single press, cannot turn one chord into
+    // two switches. (MS Word 2010 x64 is one of the latter.)
+    if (*pfEaten && wParam == VK_SPACE && CtrlDown() && !AltDown()) {
+        DsimeTrace(L"test: ctrl+space handled in the test phase");
+        _ToggleEnglishMode(pic);
+    }
     return S_OK;
 }
 
@@ -146,6 +222,13 @@ STDMETHODIMP CTextService::OnKeyUp(ITfContext* /*pic*/, WPARAM /*wParam*/,
     return S_OK;
 }
 
+// Empty, and deliberately so. This is the hook for a preserved key registered
+// with ITfKeystrokeMgr::PreserveKey, and that route was tried for Ctrl+Space and
+// removed: the trace showed registration succeeding (`hr=00000000`) and the chord
+// then producing NO callbacks at all — PreserveKey takes the key at the test
+// stage, while OnPreservedKey is delivered from the handle stage, which is the
+// one Notepad3 does not reach for this chord. See OnTestKeyDown for where the
+// switch actually lives and why.
 STDMETHODIMP CTextService::OnPreservedKey(ITfContext* /*pic*/, REFGUID /*rguid*/,
                                     BOOL* pfEaten) {
     *pfEaten = FALSE;
@@ -205,9 +288,35 @@ bool CTextService::_EnqueueIdleChar(ITfContext* pic, const std::wstring& text) {
     // With nothing queued the host's own handling of the key is both correct and
     // cheaper — there is no ordering to preserve.
     if (_jobs.empty()) return false;
-    if (!_EnqueueJob(pic, std::string(), text)) return false;
-    DsimeTrace(L"idle: queued '%s' behind %u job(s)", text.c_str(),
-               static_cast<unsigned>(_jobs.size()));
+
+    // Join the literal job already at the tail rather than mint one per
+    // character. This is what makes English mode usable: a word is eight keys,
+    // and eight jobs would mean eight anchor captures (each a synchronous edit
+    // session) and eight separate compositions opened in the document, for text
+    // that ends up in exactly the same place. Typing never moves the document, so
+    // the anchors are identical and the merged run lands in the same order.
+    //
+    // `_jobs.size() > 1` is what keeps the pump's own job out of reach: the head
+    // is the one being inserted, and a lone literal head is popped by the
+    // _PumpQueue at the end of this function, synchronously, so it can never be
+    // seen here.
+    //
+    // The context test is not decoration. A queued job outlives a focus change —
+    // _AbandonTyping drops the typing state, not the queue — so without it an
+    // alt-tab mid-word would merge one document's characters into another
+    // document's job, and they would land in whichever came first.
+    PendingJob* tail = _jobs.size() > 1 ? _jobs.back().get() : nullptr;
+    const bool merge = tail != nullptr && tail->literal && tail->context == pic;
+    if (merge) {
+        tail->result += text;
+        DsimeTrace(L"idle: merged '%s' into the tail literal (%u chars)", text.c_str(),
+                   static_cast<unsigned>(tail->result.size()));
+    } else {
+        if (!_EnqueueJob(pic, std::string(), text)) return false;
+        DsimeTrace(L"idle: queued '%s' behind %u job(s)", text.c_str(),
+                   static_cast<unsigned>(_jobs.size()));
+    }
+
     _writeFailed = false;
     _UpdateInputBox();
     _PumpQueue();
@@ -222,12 +331,87 @@ bool CTextService::_EnqueueConversion(ITfContext* pic) {
     // nothing is left anchored at this caret while the user types the next
     // sentence, and clear the box down to its pending count.
     _EndComposition(pic);
-    _pinyin.clear();
-    _composing = false;
-    _writeFailed = false;
-    _UpdateInputBox();
+    _ClearTyping();
     _PumpQueue();
     return true;
+}
+
+// The buffer, verbatim, as a literal job — Ctrl+Space interrupting what was being
+// typed. NOT converted: the user is switching to English mid-word, and spending a
+// request to turn an unfinished fragment into Chinese is not what they asked for.
+// Same four steps as _EnqueueConversion, with the model left out of it.
+void CTextService::_FlushBufferAsLiteral(ITfContext* pic) {
+    if (_pinyin.empty()) return;
+
+    // The preserved-key route can arrive before there is a context to anchor to.
+    // Same treatment as a refused edit session — the buffer waits for a keystroke
+    // rather than being written somewhere arbitrary.
+    if (pic == nullptr) {
+        DsimeTrace(L"flushLiteral: no context, deferred");
+        _flushBufferAsLiteralDue = true;
+        return;
+    }
+
+    // _EnqueueJob chooses its branch on `literal.empty()`, not on a flag, so an
+    // empty buffer would take the *conversion* path and mint a job with nothing
+    // in it. The guard above is what keeps that out of reach; this stays explicit
+    // because the discrimination is by content and reads like an accident.
+    if (_EnqueueJob(pic, std::string(), dsime::Utf8ToUtf16(_pinyin))) {
+        _EndComposition(pic);
+        _ClearTyping();
+        // Posted, not called: see WM_DSIME_PUMP. This runs from the Ctrl+Space
+        // test phase, where asking for the insert session inline gets it
+        // deferred, and a deferred session cannot produce the composition handle
+        // the write path needs — so it degrades to a write the host never
+        // repaints, and the sentence ends up in the document but invisible.
+        if (_msgWnd) {
+            ::PostMessageW(_msgWnd, WM_DSIME_PUMP, 0, 0);
+        } else {
+            _PumpQueue();  // no window to post to; better late than never
+        }
+        return;
+    }
+
+    // No anchor — the document refused the synchronous edit session. Deliberately
+    // NOT falling back to writing the buffer now: that would put it in front of
+    // sentences already owed to this document, which is the one ordering the
+    // queue exists to preserve, and the user asked for it to take its turn. Leave
+    // everything alone and retry on the next keystroke, where a session is
+    // available; Space still converts the buffer in the meantime.
+    DsimeTrace(L"flushLiteral: anchor failed, deferred");
+    _flushBufferAsLiteralDue = true;
+}
+
+// Ctrl+Space: flip between writing Chinese and writing English.
+void CTextService::_ToggleEnglishMode(ITfContext* pic) {
+    // One press can arrive down both routes — the preserved key when it
+    // registered, and the key sink as the fallback — and two toggles in a row are
+    // indistinguishable from the switch not working at all. Drop the repeat.
+    const ULONGLONG now = ::GetTickCount64();
+    if (now - _lastToggleTick < 200) {
+        DsimeTrace(L"mode: dropping a repeat within 200ms");
+        return;
+    }
+    _lastToggleTick = now;
+
+    // The buffer first, while the composition is still anchored to it.
+    if (!_englishMode && !_pinyin.empty()) _FlushBufferAsLiteral(pic);
+
+    _englishMode = !_englishMode;
+    DsimeTrace(L"mode: english=%d", static_cast<int>(_englishMode));
+
+    // Say so. The mode is the only thing on screen that distinguishes the two
+    // states, so it flashes the box even when there is nothing else to show —
+    // which is exactly the case Ctrl+Space is most often pressed in.
+    //
+    // Note this does NOT clear _writeFailed the way the conversion paths do: a
+    // red badge means a sentence never reached the document, and a mode change is
+    // no reason to stop saying so.
+    _modeFlash = true;
+    if (_msgWnd) {
+        ::SetTimer(_msgWnd, DSIME_FLASH_TIMER_ID, DSIME_FLASH_TIMER_MS, nullptr);
+    }
+    _UpdateInputBox();
 }
 
 HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
@@ -246,12 +430,32 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
         _ReanchorIfComposing(pic);
     }
 
-    DsimeTrace(L"key: vk=%u composing=%d pinyin=%u jobs=%u", static_cast<unsigned>(wParam),
-               static_cast<int>(_composing), static_cast<unsigned>(_pinyin.size()),
-               static_cast<unsigned>(_jobs.size()));
+    // A buffer Ctrl+Space wanted to hand to the queue but could not anchor. Same
+    // idiom as _reanchorDue, and for the same reason: capturing an anchor is a
+    // synchronous edit session, and TSF only grants those from a key event. The
+    // buffer has stayed in the box, and Space still converts it, so the only
+    // thing at stake is when it lands.
+    if (_flushBufferAsLiteralDue) {
+        _flushBufferAsLiteralDue = false;
+        DsimeTrace(L"flushLiteral: due, applying before key");
+        _FlushBufferAsLiteral(pic);
+    }
+
+    DsimeTrace(L"key: vk=%u composing=%d pinyin=%u jobs=%u english=%d",
+               static_cast<unsigned>(wParam), static_cast<int>(_composing),
+               static_cast<unsigned>(_pinyin.size()),
+               static_cast<unsigned>(_jobs.size()), static_cast<int>(_englishMode));
 
     switch (wParam) {
         case VK_SPACE: {
+            // Ctrl+Space is the mode switch, not a conversion. Claimed here as
+            // well as in _IsKeyEaten because that is a test, and a test must be
+            // free of side effects.
+            if (CtrlDown() && !AltDown()) {
+                _ToggleEnglishMode(pic);
+                return S_OK;
+            }
+
             // The one and only conversion trigger: hand the whole buffer to the
             // queue. The pinyin vanishes from the box immediately and the user
             // carries straight on with the next sentence; results land in the
@@ -326,6 +530,22 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
             // (Keys that produce no character at all — arrows, F-keys, Tab — never
             // reach here: ToUnicode maps them to nothing, or to a control code
             // below the printable range, and _IsKeyEaten never ate them.)
+            //
+            // English mode starts here. Nothing is pinyin and nothing is
+            // remapped, so every printable character takes the literal path and
+            // then stops — it must NOT fall through to the buffer mapping below,
+            // which would quietly start a pinyin session out of English text.
+            // (This is reachable only with a non-empty queue: with an empty one
+            // _IsKeyEaten let the key go, and the host types it natively.)
+            if (_englishMode) {
+                if (!_composing && ch >= 0x20 && ch != 0x7F &&
+                    _EnqueueIdleChar(pic, std::wstring(1, ch))) {
+                    return S_OK;
+                }
+                *pfEaten = FALSE;
+                return S_OK;
+            }
+
             if (!_composing) {
                 if (wchar_t full = FullWidthPunct(ch)) {
                     const std::wstring tail(1, full);
@@ -355,22 +575,50 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
                 }
             }
 
-            // Map the produced character to its ASCII form for the buffer.
-            // Punctuation is stored as ASCII — the model renders it full-width
-            // together with the sentence.
+            // Map the key to its ASCII form for the buffer. Punctuation is
+            // stored as ASCII — the model renders it full-width together with
+            // the sentence.
+            //
+            // Letters keep the case the user typed, and the case comes from the
+            // SHIFT KEY, not from `ch`. Capital letters in the buffer are what
+            // makes an abbreviation survive: "shiyongAI" is converted to 使用AI,
+            // while the flattened "shiyongai" gives the model no reason to prefer
+            // AI over 爱 — it reads it as pinyin, because that is what the rest
+            // of the buffer is.
+            //
+            // Reading the case off `ch` instead would break pinyin outright:
+            // with CapsLock on, ToUnicode returns capitals for ordinary typing
+            // too, so every sentence would reach the model as "NIHAO" — the very
+            // shape this is using to mean "English". Shift is also the only
+            // signal that is deliberate. Note this makes CapsLock+Shift produce a
+            // lower-case letter, which is Windows' own behaviour and the harmless
+            // direction to be wrong in.
+            const bool shifted = ShiftDown();
             char ascii = 0;
-            if (ch >= L'A' && ch <= L'Z') {
-                ascii = static_cast<char>(ch - L'A' + 'a');
-            } else if (ch >= L'a' && ch <= L'z') {
-                ascii = static_cast<char>(ch);
+            if (wParam >= 'A' && wParam <= 'Z') {
+                // Taken from the VK, which is the upper-case letter whatever
+                // Shift and CapsLock are doing, so the two sources below cannot
+                // disagree about which letter this is.
+                ascii = shifted ? static_cast<char>(wParam)
+                                : static_cast<char>(wParam - 'A' + 'a');
             } else if (ch == L'\'') {
                 ascii = '\'';
             } else if (ch > 0 && ch < 0x80 && FullWidthPunct(ch) != 0) {
                 ascii = static_cast<char>(ch);
-            } else if (wParam >= 'A' && wParam <= 'Z') {
-                // Defensive: VK said letter but ToUnicode didn't agree. Derive
-                // from VK directly.
-                ascii = static_cast<char>(wParam - 'A' + 'a');
+            } else if (_composing && ch >= 0x20 && ch < 0x7F) {
+                // Anything else printable, typed into a live buffer, belongs to
+                // the sentence being written: a digit or a '+' in the middle of
+                // pinyin carries meaning, and the model is told to keep numbers,
+                // code identifiers and URLs exactly as written.
+                //
+                // The key used to be released to the host here instead, and it
+                // never arrived: a live composition is precisely the state in
+                // which the host has nowhere to put a character it was not asked
+                // to compose, so the symbol was silently dropped. Only
+                // mid-buffer, though — with nothing being typed there is no
+                // sentence for it to belong to, and the host's own handling is
+                // both correct and cheaper.
+                ascii = static_cast<char>(ch);
             }
             if (ascii == 0) { *pfEaten = FALSE; return S_OK; }
 

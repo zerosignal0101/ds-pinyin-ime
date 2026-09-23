@@ -94,8 +94,20 @@ static void TraceReadback(TfEditCookie ec, ITfRange* range, const wchar_t* what)
 }
 
 // Submit `pES` and collapse the two failure modes into one HRESULT. On success
-// returns whatever the session reported (S_OK, or TF_S_ASYNC if TSF deferred it
-// anyway).
+// returns whatever the session reported: S_OK if it ran, or TF_S_ASYNC if TSF
+// queued it instead.
+//
+// TF_S_ASYNC is 0x00040300 — severity *success*. It means "accepted and queued",
+// which is not the same as "done", and the difference has bitten this code:
+//
+//   * A caller that needs what the session *produced* (the composition handle
+//     Dsime_RequestInsertText opens) must not read a null result as the host
+//     refusing. Queued sessions have not run yet, so their output is still unset.
+//   * A caller that only needs the session to *eventually happen* may treat it as
+//     success — TSF runs queued sessions on this context in the order submitted.
+//
+// `FAILED()` is false for it, so neither case is caught by accident; each caller
+// here decides deliberately which of the two it is.
 //
 // Every edit session in this file goes through here, so this one line of trace
 // answers the question that matters when text does not appear: did the session
@@ -865,6 +877,20 @@ HRESULT Dsime_RequestInsertText(CTextService* pSvc, ITfContext* pic, TfClientId 
         const HRESULT hr = SubmitSync(pic, tid, pES,
                                       TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
                                       L"insert.compose");
+
+        // Queued, not refused — and NOT the same as "this host will not give us
+        // a composition". `pComp` is still null because the session has not run,
+        // which used to fall into the branch below and take the bare write: the
+        // one path that puts text in the document without telling the host to
+        // repaint it, so the sentence appeared in the store and never on screen.
+        // Nothing has been written yet at this point, so the honest answer is
+        // "not yet" — hand TF_S_ASYNC back, and the caller retries from a context
+        // where the session is granted inline.
+        if (hr == TF_S_ASYNC) {
+            DsimeTrace(L"  insert: compose session QUEUED (not refused); will retry");
+            return TF_S_ASYNC;
+        }
+
         if (FAILED(hr) || pComp == nullptr) {
             if (pComp != nullptr) {
                 pComp->Release();
@@ -875,12 +901,22 @@ HRESULT Dsime_RequestInsertText(CTextService* pSvc, ITfContext* pic, TfClientId 
             CInsertTextEditSession* pBare = new (std::nothrow)
                 CInsertTextEditSession(pSvc, pic, anchor, text, moveCaret);
             if (!pBare) return E_OUTOFMEMORY;
-            return SubmitSync(pic, tid, pBare,
-                              TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, L"insert.bare");
+            // This one WRITES, so a deferral is success rather than a retry:
+            // queueing it would mean writing the sentence a second time on the
+            // retry. Only the compose step above can report TF_S_ASYNC upward.
+            const HRESULT hrBare = SubmitSync(pic, tid, pBare,
+                                              TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
+                                              L"insert.bare");
+            return (hrBare == TF_S_ASYNC) ? S_OK : hrBare;
         }
     }
 
     // 2. Write the sentence into it.
+    //
+    // A deferral here is ordinary success: the session is queued, TSF runs queued
+    // sessions in submission order, and the close in step 3 was queued behind it.
+    // Normalised to S_OK because the caller must not retry a write that is going
+    // to happen — only step 1's deferral means "nothing written yet".
     HRESULT hr = E_FAIL;
     {
         CWriteCompositionEditSession* pES = new (std::nothrow)
@@ -888,6 +924,10 @@ HRESULT Dsime_RequestInsertText(CTextService* pSvc, ITfContext* pic, TfClientId 
         if (pES) {
             hr = SubmitSync(pic, tid, pES,
                             TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, L"insert.write");
+            if (hr == TF_S_ASYNC) {
+                DsimeTrace(L"  insert: write session queued; done");
+                hr = S_OK;
+            }
         }
     }
 
