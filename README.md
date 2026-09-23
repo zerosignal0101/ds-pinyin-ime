@@ -144,6 +144,16 @@ To remove it again, use **Settings ▸ Apps ▸ Installed apps**, or
 `windows/uninstall-dspinyinime.ps1` from an elevated prompt. Your settings and
 API key survive an uninstall unless you pass `-RemoveConfig`.
 
+## Credits
+
+DS Pinyin IME is a continuation of [**ds-input**](https://github.com/madeye/ds-input)
+by [Max Lv](https://github.com/madeye). The Rust core, the C ABI, the Windows TSF
+text service and the original macOS frontend all began there; this project
+carries that work forward under a name that says what it is.
+
+The [`LICENSE`](LICENSE) is ds-input's MIT notice, unchanged — the copyright in
+it is his, and it is the attribution that actually binds.
+
 ## License
 
 MIT.
