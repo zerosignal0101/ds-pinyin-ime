@@ -23,30 +23,49 @@ document changes only when a finished Chinese sentence lands in it.
 
 | Key | Effect |
 |-----|--------|
-| `a`–`z`, `'`, `,` `.` `?` `!` `;` `:` `(` `)` `\` | append to the buffer (shown in the floating box) |
+| `a`–`z`, `'`, and any other printable | append to the buffer (shown in the floating box) |
+| **Shift**+letter | same, but the letter is kept **upper‑case** |
 | **Space** | convert the whole buffer and write the result; typing continues immediately |
 | **Enter** | write the buffer verbatim, no conversion (for English, identifiers, …) |
 | **Esc** | discard what is being typed; the queue keeps running |
 | **Backspace** | edit the buffer |
+| **Ctrl+Space** | toggle Chinese / English mode |
 
-The box also shows how many conversions are still queued. A result that cannot
-be written (the document was closed, or became read‑only) is put on the
-clipboard, and the box says so rather than dropping the sentence.
+**Shift is how an abbreviation survives.** `shiyongAI` is converted to `使用AI`;
+flattened to `shiyongai`, nothing distinguishes it from pinyin. The case is read
+from the **Shift key**, never from the character `ToUnicode` produced — with
+CapsLock on that returns capitals for ordinary typing too, and every sentence
+would arrive as `NIHAO`.
+
+**English mode (Ctrl+Space) has no buffer at all.** Nothing is converted and
+nothing is remapped to full‑width, so a whole sentence of English types
+natively; a buffer in progress when the mode flips is written **verbatim**.
+Characters typed with nothing in the buffer are written on the spot, unless a
+conversion is still on its way — then they queue behind it. Enter is the one
+exception: it is as much a command as a character (a newline in an editor,
+*submit* in a search box), so it always goes to the host.
+
+The box shows the current mode and how many conversions are still queued. A
+result that cannot be written (the document was closed, or became read‑only) is
+put on the clipboard, and the box says so rather than dropping the sentence.
 
 ## Context
 
-The model is given a **per‑input‑window** history of what has already been
-converted, so it picks up the domain, terminology and wording of the document it
-is filling in. Windows are keyed by application (`code.exe|Chrome_WidgetWin_1`),
-which means every Chrome tab shares one context — the point is industry
-vocabulary, which is a property of the app, not of a tab.
+The model is given a history of what has already been converted **in that
+program**, so it picks up the domain, terminology and wording of the document it
+is filling in. Contexts are keyed per **process** (`code.exe|1234`), which is
+what stops two Notepad3 windows editing different files from teaching the model
+each other's vocabulary. Electron apps and VS Code run every window in one
+process, so they still share a context.
 
 The history grows append‑only (which is what lets the provider's prefix cache
 hit) and is summarised automatically once it outgrows
-`context_window_tokens × context_compact_ratio`. Context is **persisted to disk**
-beside the config file, so it accumulates across restarts. It is on by default,
-can be switched off, and can be cleared from Settings — the context is a record
-of what you typed, so there has to be a way to be rid of it.
+`context_window_tokens × context_compact_ratio`. It lives **in memory only** —
+it is a record of document text, and a copy on disk would outlive the document
+it described while still being prepended to every request at token prices. Two
+consequences worth knowing: it does not survive a restart, and switching input
+methods away and back starts a fresh one. It is on by default, can be switched
+off, and can be cleared from Settings.
 
 ## Architecture
 
@@ -94,9 +113,15 @@ window (single source of truth via `ds_engine_{get,set}_config_json`):
 | `max_tokens` | `1024` | Cap per request — must also cover the model's *reasoning* tokens |
 | `reasoning_effort` | `low` | Thinking‑effort hint (`reasoning_effort`). Empty = omit the field |
 | `thinking` | _(empty)_ | Thinking switch: `enabled` / `disabled`. Empty = omit the field |
-| `timeout_ms` | `8000` | Per‑request network timeout |
-| `stream` | `true` | Stream the answer into the pre‑edit as it arrives |
-| `max_context_tokens` | `1000` | Soft per‑request context budget |
+| `timeout_ms` | `15000` | Per‑request network timeout — must clear the model's *reasoning*, not just its answer |
+| `stream` | `true` | Use the streaming API. No frontend streams: the queue is non‑streaming by design |
+| `context_enabled` | `true` | Carry the per‑process history into the next request |
+| `context_window_tokens` | `16384` | History budget; compaction fires at `× context_compact_ratio` |
+| `context_keep_recent` | `10` | Turns kept verbatim across a compaction |
+| `context_compact_ratio` | `0.75` | Fraction of the window at which compaction fires |
+| `context_max_windows` | `20` | How many per‑process contexts are remembered (in‑memory LRU) |
+| `context_prompt` | _(compaction instruction)_ | How the history is summarised |
+| `queue_max_pending` | `8` | Conversions a frontend may queue before it stops accepting more |
 
 > **Reasoning models need headroom.** The default model spends part of
 > `max_tokens` on a hidden chain of thought *before* emitting any answer; a cap
