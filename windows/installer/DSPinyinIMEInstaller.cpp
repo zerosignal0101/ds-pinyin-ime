@@ -279,6 +279,111 @@ void DeleteTree(const std::wstring& path) {
     ::SHFileOperationW(&op);
 }
 
+// Does `s` name `dir` itself or something inside it? The Session Manager stores
+// NT paths ("\??\C:\Program Files\DS Pinyin IME"), so this is a substring hunt —
+// but anchored on a following separator, so a sibling like
+// "C:\Program Files\DS Pinyin IME Extra" is not a false positive.
+bool MentionsDir(const std::wstring& s, const std::wstring& dir) {
+    if (dir.empty() || s.size() < dir.size()) return false;
+    const int n = static_cast<int>(dir.size());
+    for (size_t at = 0; at + dir.size() <= s.size(); ++at) {
+        if (::CompareStringOrdinal(s.c_str() + at, n, dir.c_str(), n, TRUE) != CSTR_EQUAL) continue;
+        const size_t end = at + dir.size();
+        if (end == s.size() || s[end] == L'\\') return true;
+    }
+    return false;
+}
+
+// Withdraw any delayed delete a previous uninstall queued for this directory.
+// ClearInstallDir falls back to MOVEFILE_DELAY_UNTIL_REBOOT when it cannot
+// remove the directory — and it never can, because the running installer is
+// inside it. That leaves the Session Manager holding a delete for a path a
+// later install may well repopulate. Windows is documented to skip a delayed
+// directory delete when the directory is not empty, but "uninstalled, then
+// reinstalled, then rebooted" must not come down to a documented maybe: being
+// wrong means a reboot empties a freshly installed Program Files directory.
+void ClearPendingDeletes(const std::wstring& dst) {
+    constexpr wchar_t kRunKey[] = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager";
+    constexpr wchar_t kValue[]  = L"PendingFileRenameOperations";
+
+    HKEY k = nullptr;
+    if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRunKey, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &k)
+        != ERROR_SUCCESS) {
+        return;  // not elevated, or nothing has ever been scheduled
+    }
+    DWORD type = 0, bytes = 0;
+    if (::RegQueryValueExW(k, kValue, nullptr, &type, nullptr, &bytes) != ERROR_SUCCESS
+        || (type != REG_MULTI_SZ && type != REG_SZ) || bytes < sizeof(wchar_t)) {
+        ::RegCloseKey(k);
+        return;
+    }
+    // Ask for the raw bytes; the buffer keeps the terminating NULs, so leave a
+    // spare pair of characters for the walk below to run into.
+    std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 2, L'\0');
+    if (::RegQueryValueExW(k, kValue, nullptr, nullptr, reinterpret_cast<BYTE*>(buf.data()), &bytes)
+        != ERROR_SUCCESS) {
+        ::RegCloseKey(k);
+        return;
+    }
+
+    // A flat list of NUL-terminated strings in (from, to) pairs. A delete is a
+    // pair whose `to` is the empty string — which is still one string on the
+    // wire, so it costs one separator to step over.
+    std::vector<std::wstring> keep;
+    bool dropped = false;
+    for (const wchar_t* p = buf.data(); *p;) {
+        std::wstring from = p;
+        p += from.size() + 1;
+        std::wstring to;
+        if (*p) {
+            to = p;
+            p += to.size() + 1;
+        } else {
+            ++p;
+        }
+        if (MentionsDir(from, dst) || MentionsDir(to, dst)) {
+            dropped = true;
+            continue;
+        }
+        keep.push_back(std::move(from));
+        keep.push_back(std::move(to));
+    }
+    if (!dropped) {
+        ::RegCloseKey(k);
+        return;
+    }
+    if (keep.empty()) {
+        ::RegDeleteValueW(k, kValue);
+    } else {
+        std::vector<wchar_t> out;
+        for (const std::wstring& s : keep) {
+            out.insert(out.end(), s.begin(), s.end());
+            out.push_back(L'\0');
+        }
+        out.push_back(L'\0');  // terminate the list
+        ::RegSetValueExW(k, kValue, 0, REG_MULTI_SZ, reinterpret_cast<const BYTE*>(out.data()),
+                         static_cast<DWORD>(out.size() * sizeof(wchar_t)));
+    }
+    ::RegCloseKey(k);
+}
+
+// Delete the "<name>.old*" files an earlier cycle renamed aside — either a
+// previous uninstall, or a previous install replacing a DLL that was still
+// loaded. Left alone they are litter that grows by a file per cycle (the legacy
+// DSInput directory accumulated ~50), and a single survivor is enough to defeat
+// the RemoveDirectoryW that finishes an uninstall. Best-effort throughout: one
+// still held open by a running process simply stays.
+void SweepRenamedAside(const std::wstring& dst) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = ::FindFirstFileW((dst + L"\\*.old*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        ::DeleteFileW((dst + L"\\" + fd.cFileName).c_str());
+    } while (::FindNextFileW(h, &fd));
+    ::FindClose(h);
+}
+
 // Clear the four files the install owns. Returns a human-readable report of what
 // happened to the awkward ones; an empty string means everything just went.
 std::wstring ClearInstallDir(const std::wstring& dst) {
@@ -395,6 +500,13 @@ bool RunUninstall(HWND dlg, bool removeConfig, std::wstring& outMsg) {
     }
 
     PostProgress(dlg, L"Removing the program files…");
+    // A delete for this directory is about to be queued below; drop the stale one
+    // first, so running uninstall twice cannot leave the Session Manager holding
+    // two entries for the same path. Then sweep what earlier cycles renamed
+    // aside — ClearInstallDir knows only the four names it owns, and one leftover
+    // file is enough to defeat the RemoveDirectoryW that finishes the job.
+    ClearPendingDeletes(dst);
+    SweepRenamedAside(dst);
     std::wstring report = ClearInstallDir(dst);
 
     ::RegDeleteKeyW(HKEY_LOCAL_MACHINE, kUninstallKey);  // no-op when absent
@@ -430,6 +542,14 @@ bool RunInstall(HWND dlg, std::wstring& outMsg) {
     PostProgress(dlg, (std::wstring(L"Installing the ") + (arm64 ? L"ARM64" : L"x64")
                        + L" build to " + dst + L"…").c_str());
     ::SHCreateDirectoryExW(nullptr, dst.c_str(), nullptr);
+
+    // Installing over an install that was uninstalled first lands on a directory
+    // the Session Manager still has a delayed delete queued for, and that is full
+    // of the *.old files that uninstall renamed aside. Clear both before writing
+    // into it: the files are litter, and that queued delete names the directory
+    // we are about to repopulate.
+    ClearPendingDeletes(dst);
+    SweepRenamedAside(dst);
 
     bool ok =
         ExtractResource(rCore,     dst + L"\\dsime.dll",          &err) &&
