@@ -82,8 +82,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      # Builds dsime.dll + the TSF text service.
-      - run: ./build.ps1
+      # CMake's VS-generator auto-discovery fails on the runner ("could not find
+      # any instance of Visual Studio") from a plain shell, so set up the MSVC
+      # environment explicitly and use Ninja, which takes the target arch from
+      # it. This is the same pairing release.yml uses. Without it *both* arches
+      # failed to configure, build.ps1 threw "No architectures built", and
+      # continue-on-error hid the failure behind a green check.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      # Builds dsime.dll + the TSF text service. x64 only: the ARM64 build is
+      # needed solely to make the universal installer, and release.yml does that
+      # one. Gating for real now, so no continue-on-error.
+      - run: ./build.ps1 -Arch x64 -Generator Ninja
         shell: pwsh
         working-directory: windows
-        continue-on-error: true # frontend is WIP; keep core gating strict
