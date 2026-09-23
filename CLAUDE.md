@@ -140,7 +140,10 @@ cd windows; ./build.ps1          # core dsime.dll + CMake builds dsime_tsf.dll +
 ```
 `windows/install-dspinyinime.ps1` (elevated) installs the trio into
 `C:\Program Files\DS Pinyin IME` and registers the text service — the scripted
-equivalent of running the guided installer.
+equivalent of running the guided installer. `windows/uninstall-dspinyinime.ps1`
+is the reverse (elevated; `-RemoveConfig` takes the settings and API key with it,
+which are otherwise kept). The guided installer does both, and records an
+`HKLM\…\Uninstall\DSPinyinIME` entry so **Settings ▸ Apps** can too.
 
 ## Things that bite
 
@@ -158,7 +161,7 @@ equivalent of running the guided installer.
   more with `thinking: {"type":"disabled"}`, which returns the answer in 0.6 s.
   The user-visible failure this replaces is a sentence of raw pinyin appearing in
   the document, which is the frontend's deliberate fallback — see
-  `%TEMP%\dsinput-error.log`.
+  `%TEMP%\dspinyinime-error.log`.
   The retry is why `timeout_ms` must clear the reasoning tail, not the answer:
   attempts are sequential and each gets its own `timeout_ms`, so a rescued
   sentence costs ~10 s before the rescue even starts.

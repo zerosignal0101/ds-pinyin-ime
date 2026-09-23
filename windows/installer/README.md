@@ -20,8 +20,15 @@ the user's Chinese (Simplified) keyboards.
    `DSPinyinIMESettings.exe`) to `%ProgramFiles%\DS Pinyin IME`.
 2. `regsvr32` the TSF DLL (the native-arch `regsvr32` matches the native-arch DLL).
 3. Adds the DS Pinyin IME profile to the user's `zh-Hans` language list.
-4. Tells the user to sign out / back in — Windows enrolls a freshly registered
+4. Copies *itself* into the install directory and records an
+   `HKLM\…\Uninstall\DSPinyinIME` entry, so the app can be removed from
+   **Settings ▸ Apps** rather than only by hand. Steps 3 and 4 are best-effort —
+   the input method works without them, it just has no entry to be found by.
+5. Tells the user to sign out / back in — Windows enrolls a freshly registered
    text service at the next logon.
+
+Run when DS Pinyin IME is already installed, the same window offers **Uninstall**
+as well — see *Run*.
 
 ## Build
 
@@ -38,18 +45,29 @@ cd windows
 
 ## Run
 
-Double-click `DSPinyinIMEInstaller.exe` (it prompts for administrator). For automation
-or headless verification, run it silently:
+Double-click `DSPinyinIMEInstaller.exe` (it prompts for administrator). If DS
+Pinyin IME is already installed the window offers **Uninstall** too, with a box
+for deleting your settings along with it.
+
+For automation or headless verification:
 
 ```powershell
-DSPinyinIMEInstaller.exe /S        # installs without UI; exit 0 = success, 1 = failure
+DSPinyinIMEInstaller.exe /S        # install, no UI; exit 0 = success, 1 = failure
+DSPinyinIMEInstaller.exe --uninstall                            # the same window, uninstall mode
+DSPinyinIMEInstaller.exe --uninstall --silent                   # uninstall, no UI
+DSPinyinIMEInstaller.exe --uninstall --silent --remove-config   # …and delete the settings
 ```
+
+`--uninstall` is what the Apps & features entry records as its `UninstallString`,
+pointing at the copy of this exe that the install leaves in the install
+directory. Flags are case-insensitive, and the older `/S` and `/silent`
+spellings still work.
 
 ## Files
 
 | File | Role |
 |------|------|
-| `DSPinyinIMEInstaller.cpp` | Wizard UI + install logic (extract, register, language list); `/S` silent mode. |
+| `DSPinyinIMEInstaller.cpp` | Wizard UI + install/uninstall logic (extract, register, language list, self-copy, Apps & features entry); silent and `--uninstall` modes. |
 | `DSPinyinIMEInstaller.rc` | Dialog template, icon, embedded manifest, and the embedded per-arch payloads. |
 | `installer.manifest` | `requireAdministrator` + common-controls + DPI awareness. |
 | `CMakeLists.txt` | Builds the installer exe (x64) with `/MANIFEST:NO` (manifest comes from the .rc). |

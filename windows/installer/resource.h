@@ -8,6 +8,8 @@
 #define IDC_BODY            102
 #define IDC_STATUS          103
 #define IDC_PROGRESS        104
+#define IDC_UNINSTALL       105  // shown only when something is installed
+#define IDC_REMOVE_CONFIG   106  // "also delete my settings" — uninstall only
 // The action button is IDOK ("Install" → "Close"); IDCANCEL is the close box.
 
 // Embedded payloads (RCDATA). One trio per architecture; the installer extracts

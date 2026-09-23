@@ -98,6 +98,29 @@ reads, so there is one source of truth.
 > must also cover the model's hidden *reasoning* tokens — a budget that is too
 > small comes back as an empty result, not an error.
 
+## Uninstall
+
+Installed with the guided installer? **Settings ▸ Apps ▸ Installed apps**, find
+**DS Pinyin IME**, choose **Uninstall**. Or directly, from an **elevated** prompt:
+
+```powershell
+./windows/uninstall-dspinyinime.ps1                 # keeps your settings
+./windows/uninstall-dspinyinime.ps1 -RemoveConfig   # deletes them too
+```
+
+Either path removes the program files, unregisters the text service with
+`regsvr32 /u`, takes the keyboard out of your language list, and drops the Apps &
+features entry. **Your settings and API key are kept** unless you ask otherwise —
+uninstalling is not the same request as "forget what I typed", and the Settings
+window has its own Clear button for that.
+
+Two caveats, both from the same cause. Apps holding the IME — Explorer, browsers,
+your editor — keep the DLL mapped, and a loaded image cannot be deleted; it is
+renamed aside instead (the mirror of what the installer does when it *replaces* a
+live DLL) and removed at the next restart. Those apps keep working from the
+renamed copy until you close them, and the install directory lingers until they
+do. Sign out and back in afterwards to clear the keyboard from the language bar.
+
 ## How it works (design notes)
 
 ### Threading / marshaling
@@ -206,7 +229,7 @@ is frontend state on purpose — see the note in `CLAUDE.md`.
   (returned in `hrSession` while the call itself reports `S_OK`). `TF_E_LOCKED`
   (document mid-edit) is retried on a timer; anything else falls back to the
   clipboard with a red badge in the box, and the HRESULT is appended to
-  `%TEMP%\dsinput-error.log`.
+  `%TEMP%\dspinyinime-error.log`.
 - **`TF_S_ASYNC` is retried, not accepted.** It is a *success* code
   (`0x00040300`) meaning "queued", and `FAILED()` is false for it — so treating it
   as done pops the job with the sentence unwritten, and no error, badge or trace
@@ -367,7 +390,7 @@ One `DsEngine` per activation (shared, internally synchronized) and one
   hatch Enter provides), so nothing is lost and the failure is visible.
 - **One sentence comes out as pinyin while the rest convert normally** — that
   conversion failed; the pinyin is the fallback, not a bad answer. Every failure
-  appends a line to `%TEMP%\dsinput-error.log`, which is empty otherwise:
+  appends a line to `%TEMP%\dspinyinime-error.log`, which is empty otherwise:
 
   ```
   conversion failed: status=3 len=41

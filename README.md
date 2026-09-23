@@ -140,6 +140,10 @@ Then `regsvr32` the DLL from an elevated prompt and add the input method in
 Settings ▸ Time & Language ▸ Language. Details in
 [`windows/README.md`](windows/README.md).
 
+To remove it again, use **Settings ▸ Apps ▸ Installed apps**, or
+`windows/uninstall-dspinyinime.ps1` from an elevated prompt. Your settings and
+API key survive an uninstall unless you pass `-RemoveConfig`.
+
 ## License
 
 MIT.
