@@ -157,3 +157,8 @@ it is his, and it is the attribution that actually binds.
 ## License
 
 MIT.
+
+---
+
+友链 / Friend link: [**linux.do**](https://linux.do) — a Chinese-language community
+for developers.
