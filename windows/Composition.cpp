@@ -31,9 +31,37 @@
 #include "Trace.h"
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cwchar>
 #include <new>
+
+// ---- the failure log -------------------------------------------------------
+
+// One line to %TEMP%\dsinput-error.log. The file is empty unless something went
+// wrong, so it is safe to leave in a shipping build and it is the first thing to
+// ask a user for — it is also the only record that survives a conversion that
+// never produced text, which otherwise leaves no evidence at all.
+//
+// Two classes of failure land here and each line names its own, so the file
+// reads unambiguously. Deliberately no document text: it lives on disk and
+// outlives the document it described — the same reason the conversation context
+// is memory-only. Lengths and status codes are enough to tell the cases apart
+// (`DS_ERR_*` in `core/include/dsime.h`).
+static void AppendErrorLog(const wchar_t* fmt, ...) {
+    wchar_t path[MAX_PATH] = {};
+    DWORD n = ::GetTempPathW(ARRAYSIZE(path), path);
+    if (n == 0 || n >= ARRAYSIZE(path) - 20) return;
+    ::wcscat_s(path, L"dsinput-error.log");
+
+    FILE* f = nullptr;
+    if (::_wfopen_s(&f, path, L"a, ccs=UTF-8") != 0 || f == nullptr) return;
+    va_list args;
+    va_start(args, fmt);
+    ::vfwprintf(f, fmt, args);
+    va_end(args);
+    ::fclose(f);
+}
 
 // Prototypes for the edit-session submitters defined in EditSessions.cpp.
 HRESULT Dsime_RequestStartComposition(CTextService* pSvc, ITfContext* pic,
@@ -332,9 +360,17 @@ void CTextService::_PumpQueue() {
                 _UpdateInputBox();
                 return;  // the terminal callback resumes the pump
             }
-            // Nothing was dispatched — no engine (bad config, missing API key),
-            // or the core refused the buffer. Fall through with no result, which
-            // _FinishJob degrades to writing the raw pinyin.
+            // Nothing was dispatched, so there is no request and no callback to
+            // report one. Fall through with no result, which _FinishJob degrades
+            // to writing the raw pinyin.
+            //
+            // This is the one silent failure the conversion callback cannot
+            // cover, so it is logged here: a session only fails to exist when
+            // the engine could not be built at all (an unreadable or malformed
+            // config.json), which otherwise shows up as pinyin appearing on the
+            // screen and no explanation anywhere.
+            AppendErrorLog(L"conversion not attempted: engine unavailable len=%u\n",
+                           static_cast<unsigned>(job->pinyin.size()));
             job->converted = true;
         }
 
@@ -467,22 +503,9 @@ void CTextService::_LoseText(const std::wstring& text, HRESULT hr) {
     // Record the HRESULT first. By the time this runs the user has nothing to go
     // on but a red badge, and the difference between TF_E_SYNCHRONOUS (the edit
     // session was refused), TS_E_READONLY and TF_E_DISCONNECTED is the whole
-    // diagnosis. Appended to only on failure, so the file stays empty in normal
-    // use and is safe to leave in a shipping build.
-    {
-        wchar_t path[MAX_PATH] = {};
-        DWORD n = ::GetTempPathW(ARRAYSIZE(path), path);
-        if (n > 0 && n < ARRAYSIZE(path) - 20) {
-            ::wcscat_s(path, L"dsinput-error.log");
-            FILE* f = nullptr;
-            if (::_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f != nullptr) {
-                ::fwprintf(f, L"insert failed: hr=0x%08X len=%u\n",
-                           static_cast<unsigned>(hr),
-                           static_cast<unsigned>(text.size()));
-                ::fclose(f);
-            }
-        }
-    }
+    // diagnosis.
+    AppendErrorLog(L"insert failed: hr=0x%08X len=%u\n", static_cast<unsigned>(hr),
+                   static_cast<unsigned>(text.size()));
 
     if (!text.empty()) {
         // The clipboard is a shared resource and another app may hold it open;
@@ -599,6 +622,14 @@ void CTextService::_OnConvertResultOnStaThread(uint64_t request_id, int32_t stat
         job->result = text;
     } else if (status == DS_ERR_CANCELLED) {
         job->cancelled = true;
+    } else {
+        // The conversion failed, so _FinishJob will write the pinyin verbatim.
+        // That fallback is deliberate — it costs the user a retype, not a
+        // sentence — but until now it was also the end of the story: a sentence
+        // of pinyin appeared, the box said nothing, and nothing anywhere said
+        // why. The status code is the whole diagnosis.
+        AppendErrorLog(L"conversion failed: status=%d len=%u\n", status,
+                       static_cast<unsigned>(job->pinyin.size()));
     }
     // Any other status leaves `result` empty, which _FinishJob turns into the
     // raw-pinyin fallback.

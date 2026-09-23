@@ -8,10 +8,8 @@
 //! context costing full price on every sentence.
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 // Multiple tokio runtimes in one process are flaky under concurrent test
 // scheduling; serialize these like the other FFI integration tests.
@@ -29,76 +27,16 @@ fn temp_config(tag: &str) -> std::path::PathBuf {
     dir.join("config.json")
 }
 
-/// Serve `bodies.len()` sequential chat-completions requests, each with the next
-/// canned JSON body, recording every request's raw bytes so the test can assert
-/// on the `messages` that were actually sent.
-fn spawn_seq_mock(bodies: Vec<&'static str>) -> (u16, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-    let seen_t = seen.clone();
-    std::thread::spawn(move || {
-        for body in bodies {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut raw = Vec::new();
-            let mut tmp = [0u8; 2048];
-            let mut content_len = None;
-            loop {
-                let n = stream.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                raw.extend_from_slice(&tmp[..n]);
-                if content_len.is_none() {
-                    if let Ok(text) = std::str::from_utf8(&raw) {
-                        if let Some(i) = text.to_ascii_lowercase().find("content-length:") {
-                            let rest = &text[i + "content-length:".len()..];
-                            let num: String = rest
-                                .trim_start()
-                                .chars()
-                                .take_while(|c| c.is_ascii_digit())
-                                .collect();
-                            content_len = num.parse::<usize>().ok();
-                        }
-                    }
-                }
-                if let (Some(cl), Some(hdr_end)) =
-                    (content_len, raw.windows(4).position(|w| w == b"\r\n\r\n"))
-                {
-                    if raw.len() >= hdr_end + 4 + cl {
-                        break;
-                    }
-                }
-            }
-            seen_t
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&raw).into_owned());
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
-        }
-    });
-    (port, seen)
-}
+mod common;
+
+use common::{body_of, spawn_seq_mock};
 
 /// The `messages` array of a captured request, decoded.
 fn messages_of(raw: &str) -> Vec<(String, String)> {
-    let body = raw
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_else(|| panic!("no request body in:\n{raw}"));
-    let json: serde_json::Value =
-        serde_json::from_str(body).unwrap_or_else(|e| panic!("body is not JSON ({e}):\n{body}"));
+    let json = body_of(raw);
     json["messages"]
         .as_array()
-        .unwrap_or_else(|| panic!("no messages array in:\n{body}"))
+        .unwrap_or_else(|| panic!("no messages array in:\n{json}"))
         .iter()
         .map(|m| {
             (

@@ -20,6 +20,21 @@ pub enum ConvertError {
     Network(String),
     Auth(String),
     Api(String),
+    /// The provider answered — and the answer had no sentence in it.
+    ///
+    /// This is its own category, rather than an [`ConvertError::Api`], because it
+    /// is the one failure a differently-shaped *retry* can fix: a reasoning model
+    /// that spends its whole budget thinking returns empty content with
+    /// `finish_reason: "length"`, which is a property of the input and the
+    /// settings, not an outage. See [`convert`] for the retry. The status code is
+    /// deliberately still 3: the C ABI, and every frontend's handling of it, is
+    /// unchanged.
+    EmptyCompletion {
+        message: String,
+        /// What the provider said about why, passed through so the retry can
+        /// tell "the budget ran out" from "the model chose to say nothing".
+        finish_reason: Option<String>,
+    },
     Cancelled,
     Config(String),
 }
@@ -28,11 +43,12 @@ impl ConvertError {
     /// Map to the integer status code exposed across the FFI boundary.
     pub fn status_code(&self) -> i32 {
         match self {
-            ConvertError::Network(_) => 1, // DS_ERR_NETWORK
-            ConvertError::Auth(_) => 2,    // DS_ERR_AUTH
-            ConvertError::Api(_) => 3,     // DS_ERR_API
-            ConvertError::Cancelled => 4,  // DS_ERR_CANCELLED
-            ConvertError::Config(_) => 5,  // DS_ERR_CONFIG
+            ConvertError::Network(_) => 1,             // DS_ERR_NETWORK
+            ConvertError::Auth(_) => 2,                // DS_ERR_AUTH
+            ConvertError::Api(_) => 3,                 // DS_ERR_API
+            ConvertError::EmptyCompletion { .. } => 3, // DS_ERR_API
+            ConvertError::Cancelled => 4,              // DS_ERR_CANCELLED
+            ConvertError::Config(_) => 5,              // DS_ERR_CONFIG
         }
     }
 
@@ -41,9 +57,26 @@ impl ConvertError {
             ConvertError::Network(m) => format!("network error: {m}"),
             ConvertError::Auth(m) => format!("auth error: {m}"),
             ConvertError::Api(m) => format!("api error: {m}"),
+            // Same prefix as `Api`: the string a frontend's Test button shows for
+            // this case has to stay what it always was.
+            ConvertError::EmptyCompletion { message, .. } => format!("api error: {message}"),
             ConvertError::Cancelled => "cancelled".to_string(),
             ConvertError::Config(m) => format!("config error: {m}"),
         }
+    }
+
+    /// True when the provider stopped because it ran out of completion tokens —
+    /// the reasoning-model failure the rescue retry exists for. A completion that
+    /// came back empty for any other stated reason is left to the ordinary
+    /// raw-pinyin fallback.
+    fn budget_exhausted(&self) -> bool {
+        matches!(
+            self,
+            ConvertError::EmptyCompletion {
+                finish_reason: Some(reason),
+                ..
+            } if reason == "length"
+        )
     }
 }
 
@@ -141,6 +174,12 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    /// `"length"` when the budget ran out. The last chunk carries it, and it is
+    /// the only thing that distinguishes an empty stream that got cut off from
+    /// one where the model chose to say nothing — the difference between an
+    /// actionable error message and a shrug.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -256,16 +295,25 @@ fn is_restricted_openai_model(model: &str) -> bool {
 /// Build the (temperature, max_tokens, max_completion_tokens) triple for a
 /// request, selecting the right token-cap field and dropping temperature for
 /// restricted OpenAI models.
-fn token_params(cfg: &Config, exclude: &[String]) -> (Option<f32>, Option<u32>, Option<u32>) {
+///
+/// `thinking_off` is what *this request* will ask for, not what the config says
+/// — the rescue attempt ([`convert`]) turns thinking off for one request, and a
+/// second reader of the same config field is exactly how the two would drift
+/// apart. Everything that decides a request field takes the same value.
+fn token_params(
+    cfg: &Config,
+    exclude: &[String],
+    thinking_off: bool,
+) -> (Option<f32>, Option<u32>, Option<u32>) {
     if is_restricted_openai_model(&cfg.model) {
         // These models only accept the default temperature (1); sending the
         // configured (lower) value errors, so omit it entirely.
         (None, None, Some(cfg.max_tokens))
     } else {
         // A provider ignores temperature while its thinking mode is on (which is
-        // the default for reasoning models), so only send it when thinking has
-        // been explicitly switched off.
-        let temperature = if thinking_disabled(cfg) {
+        // the default for reasoning models), so only send it when thinking is
+        // off for this request.
+        let temperature = if thinking_off {
             Some(effective_temperature(cfg, exclude))
         } else {
             None
@@ -283,7 +331,15 @@ fn thinking_disabled(cfg: &Config) -> bool {
 /// Split the config's thinking knobs into the two request fields. Both are
 /// omitted when unset, so a custom OpenAI-compatible endpoint that rejects them
 /// can be used by leaving the settings empty.
-fn thinking_params(cfg: &Config) -> (Option<ThinkingRequest<'_>>, Option<&str>) {
+///
+/// With `thinking_off` the request turns thinking off regardless of what the
+/// config asked for, which is the rescue attempt's whole point. `reasoning_effort`
+/// is passed through untouched even then: the measured rescue request keeps the
+/// configured effort, and there is no reason to vary two knobs at once.
+fn thinking_params(
+    cfg: &Config,
+    thinking_off: bool,
+) -> (Option<ThinkingRequest<'_>>, Option<&str>) {
     let kind = match cfg.thinking.trim().to_ascii_lowercase().as_str() {
         "enabled" => Some("enabled"),
         "disabled" => Some("disabled"),
@@ -293,6 +349,7 @@ fn thinking_params(cfg: &Config) -> (Option<ThinkingRequest<'_>>, Option<&str>) 
         "" => None,
         e => Some(e),
     };
+    let kind = if thinking_off { Some("disabled") } else { kind };
     (kind.map(|kind| ThinkingRequest { kind }), effort)
 }
 
@@ -300,6 +357,25 @@ fn thinking_params(cfg: &Config) -> (Option<ThinkingRequest<'_>>, Option<&str>) 
 /// `ctx` is the window's conversation context — pass `ContextSnapshot::default()`
 /// for none. `exclude` lists already-shown conversions to avoid (empty for the
 /// normal path; non-empty when regenerating an alternative).
+///
+/// **This may issue two requests.** A reasoning model can spend the entire
+/// `max_tokens` budget on its hidden chain of thought and return empty content
+/// with `finish_reason: "length"` — measured on hard unsegmented pinyin, and
+/// repeatedly enough to cost a user sentences. That failure is not an outage and
+/// repeating the same request does not fix it; asking for the same conversion
+/// with thinking turned off does (measured: ~10s and empty, versus 0.6s and the
+/// answer). So the one retry is shaped differently, and the second attempt reuses
+/// the same context — the domain vocabulary in it is what makes the answer right
+/// (`时域形式` rather than a plausible-looking wrong term).
+///
+/// The retry is deliberately narrow: only an empty completion that the provider
+/// itself attributed to the budget, and never when this request already turned
+/// thinking off (that would be the identical request twice). Everything else —
+/// an outage, an auth failure, a model that simply said nothing — reports through
+/// unchanged, and the frontend's raw-pinyin fallback covers it.
+///
+/// A frontend sizing its own patience against `timeout_ms` should allow for two
+/// attempts; see `ds_session_convert` in `dsime.h`.
 pub async fn convert(
     client: &reqwest::Client,
     cfg: &Config,
@@ -307,9 +383,49 @@ pub async fn convert(
     pinyin: &str,
     exclude: &[String],
 ) -> Result<Completed, ConvertError> {
+    // One reader of the config, used both for the first attempt's request fields
+    // and as the retry's guard: the guard means "a retry would send the identical
+    // request", and that is only true if both come from this one value.
+    let thinking_off = thinking_disabled(cfg);
+
+    let first = convert_attempt(client, cfg, ctx, pinyin, exclude, thinking_off).await;
+    let Err(first_err) = first else {
+        return first;
+    };
+    if thinking_off || !first_err.budget_exhausted() {
+        return Err(first_err);
+    }
+
+    match convert_attempt(client, cfg, ctx, pinyin, exclude, true).await {
+        Ok(done) => Ok(done),
+        // Both attempts empty: report both, so the one string a frontend shows
+        // carries the whole story. Anything else the rescue hit (an endpoint that
+        // does not know the `thinking` field, say) is reported as itself — its
+        // status code is the more actionable one.
+        Err(ConvertError::EmptyCompletion { message, .. }) => {
+            let first_message = first_err.message();
+            Err(ConvertError::EmptyCompletion {
+                message: format!("{first_message}; retried with thinking disabled: {message}"),
+                finish_reason: None,
+            })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// One request, no retry. `thinking_off` overrides the config for this request
+/// only — see [`convert`].
+async fn convert_attempt(
+    client: &reqwest::Client,
+    cfg: &Config,
+    ctx: &WindowContext,
+    pinyin: &str,
+    exclude: &[String],
+    thinking_off: bool,
+) -> Result<Completed, ConvertError> {
     let regen = regen_instruction(exclude);
-    let (temperature, max_tokens, max_completion_tokens) = token_params(cfg, exclude);
-    let (thinking, reasoning_effort) = thinking_params(cfg);
+    let (temperature, max_tokens, max_completion_tokens) = token_params(cfg, exclude, thinking_off);
+    let (thinking, reasoning_effort) = thinking_params(cfg, thinking_off);
     let body = ChatRequest {
         model: &cfg.model,
         messages: build_messages(cfg, ctx, pinyin, &regen),
@@ -340,8 +456,12 @@ pub async fn compact_context(
     cfg: &Config,
     ctx: &WindowContext,
 ) -> Result<String, ConvertError> {
-    let (temperature, max_tokens, max_completion_tokens) = token_params(cfg, &[]);
-    let (thinking, reasoning_effort) = thinking_params(cfg);
+    // No rescue here, deliberately: a compaction that comes back empty is
+    // swallowed by the caller (`compact_if_needed` takes `.ok()`), and the
+    // history it would have summarised is still there for the next attempt.
+    let (temperature, max_tokens, max_completion_tokens) =
+        token_params(cfg, &[], thinking_disabled(cfg));
+    let (thinking, reasoning_effort) = thinking_params(cfg, thinking_disabled(cfg));
     let body = ChatRequest {
         model: &cfg.model,
         messages: build_messages(cfg, ctx, &cfg.context_prompt, &None),
@@ -427,9 +547,12 @@ fn empty_completion(finish_reason: Option<&str>) -> ConvertError {
         Some(other) => other,
         None => "",
     };
-    ConvertError::Api(format!(
-        "the model returned an empty conversion{why}; raise `max_tokens` in Settings"
-    ))
+    ConvertError::EmptyCompletion {
+        message: format!(
+            "the model returned an empty conversion{why}; raise `max_tokens` in Settings"
+        ),
+        finish_reason: finish_reason.map(str::to_string),
+    }
 }
 
 /// Pull the `<summary>` block out of a compaction reply, dropping the
@@ -483,8 +606,14 @@ where
 
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let regen = regen_instruction(exclude);
-    let (temperature, max_tokens, max_completion_tokens) = token_params(cfg, exclude);
-    let (thinking, reasoning_effort) = thinking_params(cfg);
+    // One attempt, no rescue. Unlike `convert` this path has no caller in any
+    // frontend (the queue is non-streaming by design, and only the CLI example
+    // streams), and a retry here would mean re-running a request whose partials
+    // have already been handed out — safe today only because an empty completion
+    // implies no partial ever fired, which is not an invariant worth building on.
+    let (temperature, max_tokens, max_completion_tokens) =
+        token_params(cfg, exclude, thinking_disabled(cfg));
+    let (thinking, reasoning_effort) = thinking_params(cfg, thinking_disabled(cfg));
     let body = ChatRequest {
         model: &cfg.model,
         messages: build_messages(cfg, ctx, pinyin, &regen),
@@ -524,6 +653,7 @@ where
     let mut buf: Vec<u8> = Vec::new();
     let mut acc = String::new();
     let mut usage = Usage::default();
+    let mut finish_reason: Option<String> = None;
     while let Some(chunk) = resp
         .chunk()
         .await
@@ -544,7 +674,7 @@ where
             if payload == "[DONE]" {
                 let text = sanitize(&acc);
                 if text.is_empty() {
-                    return Err(empty_completion(None));
+                    return Err(empty_completion(finish_reason.as_deref()));
                 }
                 return Ok(Completed { text, usage });
             }
@@ -552,15 +682,16 @@ where
                 if let Some(reported) = parsed.usage {
                     usage = reported;
                 }
-                if let Some(piece) = parsed
-                    .choices
-                    .into_iter()
-                    .next()
-                    .and_then(|c| c.delta.content)
-                {
-                    if !piece.is_empty() {
-                        acc.push_str(&piece);
-                        on_delta(&acc);
+                if let Some(choice) = parsed.choices.into_iter().next() {
+                    // Reported once, on the final chunk before [DONE].
+                    if choice.finish_reason.is_some() {
+                        finish_reason = choice.finish_reason;
+                    }
+                    if let Some(piece) = choice.delta.content {
+                        if !piece.is_empty() {
+                            acc.push_str(&piece);
+                            on_delta(&acc);
+                        }
                     }
                 }
             }
@@ -569,7 +700,7 @@ where
 
     let text = sanitize(&acc);
     if text.is_empty() {
-        return Err(empty_completion(None));
+        return Err(empty_completion(finish_reason.as_deref()));
     }
     Ok(Completed { text, usage })
 }
@@ -603,6 +734,15 @@ mod tests {
         assert_eq!(ConvertError::Network(String::new()).status_code(), 1);
         assert_eq!(ConvertError::Auth(String::new()).status_code(), 2);
         assert_eq!(ConvertError::Api(String::new()).status_code(), 3);
+        assert_eq!(
+            ConvertError::EmptyCompletion {
+                message: String::new(),
+                finish_reason: None,
+            }
+            .status_code(),
+            3,
+            "an empty completion is DS_ERR_API: the C ABI must not grow a code"
+        );
         assert_eq!(ConvertError::Cancelled.status_code(), 4);
         assert_eq!(ConvertError::Config(String::new()).status_code(), 5);
     }
@@ -651,7 +791,7 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             ..base.clone()
         };
-        let (temp, max_tok, max_comp) = token_params(&cfg, &[]);
+        let (temp, max_tok, max_comp) = token_params(&cfg, &[], thinking_disabled(&cfg));
         assert_eq!(temp, Some(0.3));
         assert_eq!(max_tok, Some(256));
         assert_eq!(max_comp, None);
@@ -661,7 +801,7 @@ mod tests {
             model: "gpt-5.5".to_string(),
             ..base
         };
-        let (temp, max_tok, max_comp) = token_params(&cfg, &[]);
+        let (temp, max_tok, max_comp) = token_params(&cfg, &[], thinking_disabled(&cfg));
         assert_eq!(temp, None);
         assert_eq!(max_tok, None);
         assert_eq!(max_comp, Some(256));
@@ -686,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn temperature_is_omitted_while_thinking_is_on() {
+    fn temperature_follows_this_requests_thinking_mode() {
         // A provider ignores temperature while its thinking mode is on, and that
         // mode is on by default — so no temperature may be sent.
         let cfg = Config {
@@ -694,21 +834,26 @@ mod tests {
             temperature: 0.3,
             ..Config::default() // thinking: ""
         };
-        assert_eq!(token_params(&cfg, &[]).0, None);
+        assert_eq!(token_params(&cfg, &[], false).0, None);
 
-        // Explicitly switching thinking off makes temperature meaningful again.
+        // The rescue attempt turns thinking off for one request without touching
+        // the config, and that is the only case in which temperature is
+        // meaningful — so it must follow the flag, not the stored value.
+        assert_eq!(token_params(&cfg, &[], true).0, Some(0.3));
+
+        // Explicitly switching thinking off in the config does the same thing.
         let cfg = Config {
             thinking: "disabled".to_string(),
             ..cfg
         };
-        assert_eq!(token_params(&cfg, &[]).0, Some(0.3));
+        assert_eq!(token_params(&cfg, &[], true).0, Some(0.3));
     }
 
     #[test]
     fn thinking_params_serialize_only_when_configured() {
         // Defaults: the effort hint is sent, the thinking switch is not.
         let cfg = Config::default();
-        let (thinking, effort) = thinking_params(&cfg);
+        let (thinking, effort) = thinking_params(&cfg, thinking_disabled(&cfg));
         assert!(thinking.is_none());
         assert_eq!(effort, Some("low"));
 
@@ -718,7 +863,7 @@ mod tests {
             reasoning_effort: String::new(),
             ..Config::default()
         };
-        let (thinking, effort) = thinking_params(&cfg);
+        let (thinking, effort) = thinking_params(&cfg, thinking_disabled(&cfg));
         assert_eq!(thinking.map(|t| t.kind), Some("enabled"));
         assert!(effort.is_none());
 
@@ -727,20 +872,38 @@ mod tests {
             thinking: " DISABLED ".to_string(),
             ..Config::default()
         };
-        assert_eq!(thinking_params(&cfg).0.map(|t| t.kind), Some("disabled"));
+        assert_eq!(
+            thinking_params(&cfg, thinking_disabled(&cfg))
+                .0
+                .map(|t| t.kind),
+            Some("disabled")
+        );
 
         let cfg = Config {
             thinking: "sometimes".to_string(),
             ..Config::default()
         };
-        assert!(thinking_params(&cfg).0.is_none());
+        assert!(thinking_params(&cfg, thinking_disabled(&cfg)).0.is_none());
+
+        // The rescue flag overrides whatever the config asked for — including a
+        // user who explicitly turned thinking *on*. Falling back to their
+        // settings would cost them the sentence.
+        let cfg = Config {
+            thinking: "enabled".to_string(),
+            ..Config::default()
+        };
+        let (thinking, effort) = thinking_params(&cfg, true);
+        assert_eq!(thinking.map(|t| t.kind), Some("disabled"));
+        assert_eq!(effort, Some("low"), "effort is left as configured");
     }
 
     #[test]
     fn default_request_carries_effort_and_no_temperature() {
         let cfg = Config::default();
-        let (temperature, max_tokens, max_completion_tokens) = token_params(&cfg, &[]);
-        let (thinking, reasoning_effort) = thinking_params(&cfg);
+        let thinking_off = thinking_disabled(&cfg);
+        let (temperature, max_tokens, max_completion_tokens) =
+            token_params(&cfg, &[], thinking_off);
+        let (thinking, reasoning_effort) = thinking_params(&cfg, thinking_off);
         let body = ChatRequest {
             model: &cfg.model,
             messages: vec![],

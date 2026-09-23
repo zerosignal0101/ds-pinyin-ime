@@ -16,6 +16,25 @@ pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 /// roughly half the latency.
 pub const DEFAULT_REASONING_EFFORT: &str = "low";
 
+/// Per-request network timeout. It has to clear the *reasoning* tail, not just
+/// the answer: on hard unsegmented pinyin a reasoning model routinely takes
+/// 2–4 s, has been measured finishing a legitimate conversion at 8.1 s, and
+/// spends ~10.5 s before giving up and returning an empty completion (see
+/// `api::convert`'s rescue retry). The 8 s this used to be cut off good work.
+pub const DEFAULT_TIMEOUT_MS: u64 = 15_000;
+
+/// Every past value of the [`DEFAULT_TIMEOUT_MS`] default, oldest first — the
+/// same contract as [`LEGACY_SYSTEM_PROMPTS`], and needed for the same reason:
+/// the timeout is *stored* in config.json, so changing the constant in code
+/// reaches nobody who has ever run the app. Append only; never edit an entry
+/// after the fact.
+///
+/// The exact-match inference is weaker here than it is for the prompt — a user
+/// could have chosen 8000 deliberately — but the direction is what makes it
+/// safe: this upgrade only ever extends patience, and cannot discard anything
+/// the user wrote.
+pub const LEGACY_TIMEOUT_MS: &[u64] = &[8000];
+
 /// Instruction that turns a chat model into a whole-sentence pinyin converter.
 // Kept byte-stable and sent as the first (system) message on every request so it
 // forms a constant cacheable prefix — DeepSeek context caching then bills it at
@@ -104,7 +123,7 @@ fn default_max_tokens() -> u32 {
     1024
 }
 fn default_timeout_ms() -> u64 {
-    8000
+    DEFAULT_TIMEOUT_MS
 }
 fn default_stream() -> bool {
     true
@@ -170,7 +189,10 @@ pub struct Config {
     /// explicitly.
     #[serde(default)]
     pub thinking: String,
-    /// Per-request network timeout.
+    /// Per-request network timeout. See [`DEFAULT_TIMEOUT_MS`] for what it has
+    /// to cover — this is not the timeout of a chat request that answers in
+    /// milliseconds, and a conversion that is still being thought about is not a
+    /// failed one.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     /// Stream the conversion (SSE) so the pre-edit fills in token-by-token.
@@ -253,7 +275,7 @@ impl Config {
                 let mut cfg: Config = serde_json::from_str(&text).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                 })?;
-                if cfg.upgrade_default_prompt() {
+                if cfg.upgrade_defaults() {
                     // Best effort. A read-only config directory must not stop the
                     // IME from running -- it just means the user gets the new
                     // prompt again next launch, and it is upgraded in memory
@@ -289,6 +311,35 @@ impl Config {
         true
     }
 
+    /// Move a stock `timeout_ms` forward to the current default. Same exact-match
+    /// contract as [`Config::upgrade_default_prompt`] — see
+    /// [`LEGACY_TIMEOUT_MS`] for why widening a timeout makes that inference
+    /// safe where the prompt needed the byte-for-byte comparison.
+    fn upgrade_timeout_ms(&mut self) -> bool {
+        if !LEGACY_TIMEOUT_MS.contains(&self.timeout_ms) {
+            return false;
+        }
+        self.timeout_ms = DEFAULT_TIMEOUT_MS;
+        true
+    }
+
+    /// Every stock value that has moved on since this config was written.
+    ///
+    /// Deliberately two statements rather than `a() || b()`: `||` short-circuits,
+    /// so a config that is stale in both dimensions would upgrade only the first
+    /// — and that is precisely the config belonging to someone who has been
+    /// running the app across both releases.
+    ///
+    /// Note this only runs on the load path. A frontend that saves through
+    /// `ds_engine_set_config_json` writes the config directly and never comes
+    /// through here, which is why the frontends' own copy of a default (the
+    /// Settings dialog's blank-field fallbacks) has to be kept in step by hand.
+    fn upgrade_defaults(&mut self) -> bool {
+        let prompt = self.upgrade_default_prompt();
+        let timeout = self.upgrade_timeout_ms();
+        prompt || timeout
+    }
+
     /// Pretty-print to `path`, creating parent directories as needed.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
@@ -311,6 +362,10 @@ mod tests {
         assert_eq!(c.model, "deepseek-v4-flash");
         assert!(c.api_key.is_empty());
         assert!(c.max_tokens > 0);
+        // Long enough to clear the reasoning tail, not just the answer; see
+        // DEFAULT_TIMEOUT_MS.
+        assert_eq!(c.timeout_ms, DEFAULT_TIMEOUT_MS);
+        assert!(c.timeout_ms >= 15_000);
     }
 
     #[test]
@@ -420,6 +475,85 @@ mod tests {
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("CONVERT THIS MY WAY"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_timeout_is_upgraded() {
+        // Same trap as the prompt: the value lives in config.json, so every
+        // install that ran the 8 s build still has 8 s and would never see a
+        // change to the constant.
+        let dir = std::env::temp_dir().join(format!("dsime-cfg-tmo-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stale = Config {
+            timeout_ms: LEGACY_TIMEOUT_MS[0],
+            ..Config::default()
+        };
+        stale.save(&path).unwrap();
+
+        let loaded = Config::load_or_create(&path).unwrap();
+        assert_eq!(loaded.timeout_ms, DEFAULT_TIMEOUT_MS);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(&DEFAULT_TIMEOUT_MS.to_string()),
+            "the upgrade has to be written back, or Settings would still show the \
+             old value and a later Save would resurrect it"
+        );
+
+        // Listing the current default as a legacy value would make the upgrade a
+        // no-op that looks like it works.
+        assert!(!LEGACY_TIMEOUT_MS.contains(&DEFAULT_TIMEOUT_MS));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chosen_timeout_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("dsime-cfg-tmo2-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Only the stock value is ours to move: anyone who typed a number into
+        // the field — slower or faster than the default — keeps it.
+        for chosen in [3000u64, 10_000, 60_000] {
+            let mine = Config {
+                timeout_ms: chosen,
+                ..Config::default()
+            };
+            mine.save(&path).unwrap();
+            assert_eq!(Config::load_or_create(&path).unwrap().timeout_ms, chosen);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn both_stock_upgrades_apply_in_one_load() {
+        // The regression test for `upgrade_defaults` short-circuiting: a config
+        // written by the oldest build in the wild is stale in both dimensions,
+        // and both have to move on the same load.
+        let dir = std::env::temp_dir().join(format!("dsime-cfg-both-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stale = Config {
+            system_prompt: LEGACY_SYSTEM_PROMPTS[0].to_string(),
+            timeout_ms: LEGACY_TIMEOUT_MS[0],
+            ..Config::default()
+        };
+        stale.save(&path).unwrap();
+
+        let loaded = Config::load_or_create(&path).unwrap();
+        assert_eq!(loaded.system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(loaded.timeout_ms, DEFAULT_TIMEOUT_MS);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("UPPER-CASE"));
+        assert!(on_disk.contains(&DEFAULT_TIMEOUT_MS.to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

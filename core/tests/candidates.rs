@@ -9,10 +9,8 @@
 //!   4. up/down then revisit the cached candidates with no further network.
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 // Multiple tokio runtimes in one process are flaky under concurrent test
 // scheduling; serialize these like the other FFI integration tests.
@@ -40,66 +38,9 @@ unsafe fn take_string(p: *mut c_char) -> String {
     s
 }
 
-/// Serve `bodies.len()` sequential chat-completions requests, each with the next
-/// canned JSON body. Records every request's raw bytes so the test can assert
-/// what was sent (e.g. that regeneration excludes prior candidates).
-fn spawn_seq_mock(bodies: Vec<&'static str>) -> (u16, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-    let seen_t = seen.clone();
-    std::thread::spawn(move || {
-        for body in bodies {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            // Read headers, then the Content-Length body, so the full request
-            // (including the exclusion instruction) is captured.
-            let mut raw = Vec::new();
-            let mut tmp = [0u8; 2048];
-            let mut content_len = None;
-            loop {
-                let n = stream.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                raw.extend_from_slice(&tmp[..n]);
-                if content_len.is_none() {
-                    if let Ok(text) = std::str::from_utf8(&raw) {
-                        if let Some(i) = text.to_ascii_lowercase().find("content-length:") {
-                            let rest = &text[i + "content-length:".len()..];
-                            let num: String = rest
-                                .trim_start()
-                                .chars()
-                                .take_while(|c| c.is_ascii_digit())
-                                .collect();
-                            content_len = num.parse::<usize>().ok();
-                        }
-                    }
-                }
-                if let (Some(cl), Some(hdr_end)) =
-                    (content_len, raw.windows(4).position(|w| w == b"\r\n\r\n"))
-                {
-                    if raw.len() >= hdr_end + 4 + cl {
-                        break;
-                    }
-                }
-            }
-            seen_t
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&raw).into_owned());
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
-        }
-    });
-    (port, seen)
-}
+mod common;
+
+use common::spawn_seq_mock;
 
 extern "C" fn capture(user_data: *mut c_void, _req: u64, status: i32, text: *const c_char) {
     let s = if text.is_null() {

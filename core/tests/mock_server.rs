@@ -16,6 +16,174 @@ use dsime::{
     ds_session_set_input, EngineHandle, Session,
 };
 
+mod common;
+
+use common::{body_of, spawn_seq_mock, spawn_seq_mock_with};
+
+/// A completion that came back with nothing in it, and the provider's own
+/// explanation for why. `"length"` is what a reasoning model returns when it
+/// spent the whole `max_tokens` budget thinking; the other reasons mean the
+/// model simply said nothing.
+fn empty_completion(finish_reason: &str) -> String {
+    format!(
+        r#"{{"choices":[{{"message":{{"role":"assistant","content":""}},"finish_reason":"{finish_reason}"}}]}}"#
+    )
+}
+
+const CONVERTED: &str =
+    r#"{"choices":[{"message":{"role":"assistant","content":"你好世界"},"finish_reason":"stop"}]}"#;
+
+/// One conversion, driven through the FFI, waiting for its terminal callback.
+/// `config_extra` is merged into the JSON config the engine is given.
+fn run_one_conversion(tag: &str, port: u16, config_extra: &str) -> (i32, String, Vec<String>) {
+    let tmp = std::env::temp_dir().join(format!("dsime-{tag}-{}.json", std::process::id()));
+    let cpath = CString::new(tmp.to_string_lossy().as_bytes()).unwrap();
+
+    let mut out = (0, String::new(), Vec::new());
+    unsafe {
+        let engine: *mut EngineHandle = ds_engine_new(cpath.as_ptr());
+        assert!(!engine.is_null());
+
+        let cfg = format!(
+            r#"{{"base_url":"http://127.0.0.1:{port}","api_key":"sk-test","model":"mock","stream":false{config_extra}}}"#
+        );
+        let ccfg = CString::new(cfg).unwrap();
+        assert_eq!(ds_engine_set_config_json(engine, ccfg.as_ptr()), 0);
+
+        let session: *mut Session = ds_session_new(engine);
+        let input = CString::new("nihaoshijie").unwrap();
+        ds_session_set_input(session, input.as_ptr());
+
+        let (tx, rx) = sync_channel::<(i32, String)>(4);
+        let req = ds_session_convert(session, capture, &tx as *const _ as *mut c_void);
+        assert!(req > 0);
+        let (status, text) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the terminal callback must always fire");
+        out.0 = status;
+        out.1 = text;
+
+        ds_session_free(session);
+        ds_engine_free(engine);
+    }
+    let _ = std::fs::remove_file(&tmp);
+    out
+}
+
+/// `expected` bodies are served; `requests` is returned so the caller can check
+/// both how many arrived and what they contained.
+fn run_conversions(
+    tag: &str,
+    bodies: Vec<&'static str>,
+    config_extra: &str,
+) -> (i32, String, Vec<String>) {
+    let (port, seen) = spawn_seq_mock(bodies);
+    let (status, text, _) = run_one_conversion(tag, port, config_extra);
+    let requests = seen.lock().unwrap().clone();
+    (status, text, requests)
+}
+
+/// A reasoning model that returns an empty completion still owes the user the
+/// sentence: the retry asks for thinking to be switched off, which is the
+/// difference between ~10 s of empty reply and 0.6 s of answer (measured).
+#[test]
+fn an_empty_completion_is_rescued_with_thinking_disabled() {
+    let empty = empty_completion("length");
+    let bodies = vec![Box::leak(empty.into_boxed_str()) as &'static str, CONVERTED];
+    let (status, text, requests) = run_conversions("rescue", bodies, "");
+
+    assert_eq!(status, 0, "the rescue should have produced a conversion");
+    assert_eq!(text, "你好世界");
+    assert_eq!(requests.len(), 2, "exactly one retry");
+
+    // The first attempt is the configured request: thinking is not mentioned at
+    // all, and neither is temperature (a provider ignores it while thinking on).
+    let first = body_of(&requests[0]);
+    assert!(first.get("thinking").is_none());
+    assert!(first.get("temperature").is_none());
+
+    // The rescue has to be a *different* request, or it would fail the same way
+    // — and it has to carry the temperature that only means something once
+    // thinking is off, not just an overridden thinking field.
+    let second = body_of(&requests[1]);
+    assert_eq!(second["thinking"]["type"], "disabled");
+    assert!(
+        second.get("temperature").is_some(),
+        "the rescue sends the configured temperature; thinking_off must reach \
+         token_params, not just thinking_params"
+    );
+    assert_eq!(
+        second["messages"], first["messages"],
+        "the rescue reuses the same context — it is what makes the answer right"
+    );
+}
+
+/// "The model returned nothing and did not say why" is not the failure the
+/// rescue addresses, and guessing would mean sending a `thinking` field to a
+/// provider that may not know it.
+#[test]
+fn a_completion_that_is_empty_for_another_reason_is_not_rescued() {
+    let empty = empty_completion("stop");
+    let bodies = vec![Box::leak(empty.into_boxed_str()) as &'static str];
+    let (status, _, requests) = run_conversions("norescue-stop", bodies, "");
+
+    assert_eq!(
+        status, 3,
+        "DS_ERR_API: the frontend then writes the raw pinyin"
+    );
+    assert_eq!(requests.len(), 1);
+}
+
+/// A refusal from the provider is not something a second identically-shaped
+/// request fixes, and the retry is deliberately narrow enough not to try.
+#[test]
+fn a_provider_error_is_not_rescued() {
+    // The second response is a working conversion, so this is decisive: a retry
+    // would have collected it and reported DS_OK.
+    let (port, seen) = spawn_seq_mock_with(vec![
+        (500, r#"{"error":{"message":"upstream is unwell"}}"#),
+        (200, CONVERTED),
+    ]);
+    let (status, _, _) = run_one_conversion("norescue-http", port, "");
+
+    assert_eq!(status, 3, "DS_ERR_API for an HTTP error");
+    assert_eq!(seen.lock().unwrap().len(), 1, "no retry for an HTTP error");
+}
+
+/// Retrying when thinking is already off would send the identical request.
+#[test]
+fn no_rescue_when_thinking_is_already_disabled() {
+    let empty = empty_completion("length");
+    let bodies = vec![Box::leak(empty.into_boxed_str()) as &'static str];
+    let (status, _, requests) =
+        run_conversions("norescue-flag", bodies, r#","thinking":"disabled""#);
+
+    assert_eq!(status, 3);
+    assert_eq!(requests.len(), 1, "the guard must stop the second request");
+}
+
+/// When even the rescue comes back empty the caller still gets one terminal
+/// callback and one error — and a message that covers both attempts, since that
+/// string is all a frontend has to show.
+#[test]
+fn a_rescue_that_also_fails_reports_both_attempts() {
+    let a = empty_completion("length");
+    let b = empty_completion("length");
+    let bodies = vec![
+        Box::leak(a.into_boxed_str()) as &'static str,
+        Box::leak(b.into_boxed_str()) as &'static str,
+    ];
+    let (port, seen) = spawn_seq_mock(bodies);
+    let (status, text, _) = run_one_conversion("rescue-both", port, "");
+
+    assert_eq!(status, 3);
+    assert!(
+        text.contains("retried with thinking disabled"),
+        "the message should say a retry happened: {text}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
 /// Serve exactly one request: read the (ignored) body, reply with `body_json`.
 fn spawn_mock(body_json: &'static str) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

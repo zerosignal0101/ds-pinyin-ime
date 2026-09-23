@@ -261,9 +261,16 @@ std::string BuildConfigJson(HWND dlg) {
     std::string queue_max  = dsime::Utf16ToUtf8(GetText(dlg, IDC_QUEUE_MAX_PENDING));
 
     // Default numeric fields if the user blanked them, so the JSON stays valid.
+    //
+    // These literals are copies of the core's `default_*()` functions, and that
+    // duplication has teeth: saving here goes through `ds_engine_set_config_json`,
+    // which writes the object straight out and never re-enters
+    // `Config::load_or_create` — so the core's stock-value migrations do not run
+    // on this path. A stale literal here silently writes the old default back
+    // into a config that had just been migrated. Keep them in step by hand.
     if (temp.empty())       temp = "0.3";
     if (max_tokens.empty()) max_tokens = "1024";
-    if (timeout.empty())    timeout = "8000";
+    if (timeout.empty())    timeout = "15000";   // core: DEFAULT_TIMEOUT_MS
     if (ctx_window.empty()) ctx_window = "16384";
     if (ctx_recent.empty()) ctx_recent = "10";
     if (queue_max.empty())  queue_max = "8";

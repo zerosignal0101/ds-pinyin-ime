@@ -147,11 +147,21 @@ equivalent of running the guided installer.
 - **Reasoning models and `max_tokens`**: the default model (`deepseek-v4-flash`)
   is a reasoning model. It spends part of `max_tokens` on a hidden chain of
   thought *before* emitting any answer, and an exhausted budget returns **empty
-  content with `finish_reason: length`** — not an error. Symptoms are confusing
-  (the IME appears to produce nothing, or to "keep" whatever was last shown), so
-  when conversion output looks wrong or empty, check the token budget first. The
-  default is `1024`; measured reasoning for one 62-character unsegmented pinyin
-  sentence ran 700–2200 tokens depending on `reasoning_effort`.
+  content with `finish_reason: length`** — not an error. Measured reasoning for
+  one 62-character unsegmented pinyin sentence ran 700–2200 tokens depending on
+  `reasoning_effort`, and on a genuinely hard one the model can spend the whole
+  budget without converging: `manzuyixiashiyuxingshideguangyishiliangManakovfangcheng`
+  came back empty 3 times out of 3 with no context, at ~10 s each. Raising the
+  budget does not help — at `4096` it reasons to 4096 and is still empty — so the
+  answer is `api::convert`'s **rescue retry**: when a completion comes back empty
+  with `finish_reason: "length"`, the same request (same context) is sent once
+  more with `thinking: {"type":"disabled"}`, which returns the answer in 0.6 s.
+  The user-visible failure this replaces is a sentence of raw pinyin appearing in
+  the document, which is the frontend's deliberate fallback — see
+  `%TEMP%\dsinput-error.log`.
+  The retry is why `timeout_ms` must clear the reasoning tail, not the answer:
+  attempts are sequential and each gets its own `timeout_ms`, so a rescued
+  sentence costs ~10 s before the rescue even starts.
 - **`temperature` is ignored in thinking mode** (the provider documents that it
   neither errors nor takes effect). `api.rs` therefore omits it unless
   `thinking` is explicitly `disabled`.
@@ -203,13 +213,21 @@ equivalent of running the guided installer.
   carried through it). Saving replaces the whole JSON object and every field is
   `#[serde(default)]`, so an omitted field is not preserved — it silently reverts
   to its default.
-- **Changing `DEFAULT_SYSTEM_PROMPT` reaches nobody on its own.** The prompt is
-  *stored* in config.json, so every install that has ever run the app keeps the
-  text it was first given — a rule the user cannot receive is not a fix. Pair the
-  change with the outgoing value frozen into `LEGACY_SYSTEM_PROMPTS`
-  (`core/src/config.rs`), which `Config::load_or_create` matches byte-for-byte and
-  upgrades; anything else is the user's own edit and is left alone. Add the
-  example to the *rule* too: few-shot examples dominate instructions here.
+- **Changing a stock config value reaches nobody on its own.** Every field is
+  *stored* in config.json, so an install that has ever run the app keeps the value
+  it was first given — a fix the user cannot receive is not a fix. Pair the change
+  with the outgoing value frozen into a legacy list (`LEGACY_SYSTEM_PROMPTS`,
+  `LEGACY_TIMEOUT_MS` in `core/src/config.rs`), which `Config::load_or_create`
+  matches exactly and upgrades; anything else is the user's own choice and is left
+  alone. Two corollaries:
+  - For `DEFAULT_SYSTEM_PROMPT` specifically, add the example to the *rule* too:
+    few-shot examples dominate instructions here.
+  - **`Config::load_or_create` is not the only way a config is written.**
+    `ds_engine_set_config_json` deserializes and saves directly, so the Settings
+    dialog's Save bypasses every migration — as does its own copy of each default
+    (`DSInputSettings.cpp`'s blank-field fallbacks). Change a core default and the
+    frontend's copy has to move with it, or blanking that field silently writes
+    the old value back into a config that had just been migrated.
 - **Ctrl+Space has two separate ways to go wrong, and they need opposite fixes.**
   1. *Windows may own the chord.* The Chinese language pack ships a legacy hotkey,
      "输入法/非输入法切换", bound to Ctrl+Space and handled by the input-language

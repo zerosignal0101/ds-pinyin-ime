@@ -365,6 +365,21 @@ One `DsEngine` per activation (shared, internally synchronized) and one
   endpoint is unreachable. Open Settings and verify Base URL / API Key / Model.
   When a conversion fails, the raw pinyin is written instead (the same escape
   hatch Enter provides), so nothing is lost and the failure is visible.
+- **One sentence comes out as pinyin while the rest convert normally** — that
+  conversion failed; the pinyin is the fallback, not a bad answer. Every failure
+  appends a line to `%TEMP%\dsinput-error.log`, which is empty otherwise:
+
+  ```
+  conversion failed: status=3 len=41
+  insert failed: hr=0x80004005 len=12
+  ```
+
+  `status` is one of the `DS_ERR_*` codes: **1** network (including the per-request
+  timeout, which is 15 s), **2** auth (bad API key), **3** API error — most often
+  an empty completion, which the IME retries once with thinking disabled before
+  giving up, **4** cancelled, **5** config. Neither line carries any of your text.
+  A sentence of pinyin with *no* line in the log means the conversion never
+  happened at all: check that the engine could be built from config.json.
 - **DLL fails to load (0x8007007E)** — `dsime.dll` isn't next to
   `dsime_tsf.dll`. Keep them in the same folder.
 - **The floating box is missing or in the wrong place** — the host doesn't

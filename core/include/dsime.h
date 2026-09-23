@@ -140,6 +140,12 @@ void       ds_session_set_context_key(DsSession *session, const char *key_utf8);
  * status DS_ERR_CANCELLED. This lets the frontend safely tie per-request
  * resources (e.g. a retained context pointer) to the callback.
  *
+ * One conversion may issue TWO requests to the provider: a reasoning model that
+ * spends its whole token budget thinking returns empty content, and that is
+ * retried once with thinking switched off. Nothing about the contract above
+ * changes, but a frontend sizing its own patience against the configured
+ * timeout should allow for two of them.
+ *
  * ds_engine_free() honours this too: it cancels outstanding work and waits
  * (bounded) for the pending callbacks to land before tearing the engine down.
  * The wait is capped, so a frontend that cannot tolerate even that should
