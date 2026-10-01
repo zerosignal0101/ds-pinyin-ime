@@ -42,6 +42,20 @@ foreach ($a in @("x64", "arm64")) {
     }
 }
 
+# The dictionary is architecture-independent — one copy, embedded once — so it is
+# checked separately from the per-arch trio. It is a hard requirement rather than
+# an optional extra because the alternative is an installer that succeeds and
+# produces an IME with no segmentation, no candidates and no digit selection, with
+# nothing anywhere reporting that. The .rc names this exact path, so a missing file
+# would fail the resource compiler with a far less obvious message.
+$Lex = Join-Path $Win "dist/dsime.lex"
+if (-not (Test-Path $Lex)) {
+    throw "missing $Lex — the installer embeds the pinyin dictionary, and an install " +
+          "without it has no candidates at all. Build it with:" +
+          "`n    `$(set DSIME_RIME_DIR=<path to rime-frost>) ; ./build.ps1 -Arch x64" +
+          "`n(then -Arch arm64 for the other payload, or -Arch all)."
+}
+
 Write-Host "==> Compiling the installer (x64, $Generator)" -ForegroundColor Cyan
 $Build = Join-Path $Dir "build"
 New-Item -ItemType Directory -Force -Path $Build | Out-Null

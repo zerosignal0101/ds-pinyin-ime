@@ -384,11 +384,12 @@ void SweepRenamedAside(const std::wstring& dst) {
     ::FindClose(h);
 }
 
-// Clear the four files the install owns. Returns a human-readable report of what
+// Clear the files the install owns. Returns a human-readable report of what
 // happened to the awkward ones; an empty string means everything just went.
 std::wstring ClearInstallDir(const std::wstring& dst) {
     const wchar_t* kFiles[] = {
-        L"dsime.dll", L"dsime_tsf.dll", L"DSPinyinIMESettings.exe", kInstallerExeName,
+        L"dsime.dll", L"dsime_tsf.dll", L"DSPinyinIMESettings.exe", L"dsime.lex",
+        kInstallerExeName,
     };
     std::wstring aside, stuck;
     for (const wchar_t* f : kFiles) {
@@ -554,7 +555,14 @@ bool RunInstall(HWND dlg, std::wstring& outMsg) {
     bool ok =
         ExtractResource(rCore,     dst + L"\\dsime.dll",          &err) &&
         ExtractResource(rTsf,      dst + L"\\dsime_tsf.dll",      &err) &&
-        ExtractResource(rSettings, dst + L"\\DSPinyinIMESettings.exe", &err);
+        ExtractResource(rSettings, dst + L"\\DSPinyinIMESettings.exe", &err) &&
+        // Last, and part of the same `&&` chain on purpose. The dictionary is
+        // architecture-independent, so it is extracted for both hosts from one
+        // resource; putting it in the chain rather than in a best-effort branch is
+        // what makes "the install has no candidates" an install failure instead of
+        // a silent downgrade. The IME co-locates it with the DLLs because
+        // ds_lexicon_set_path is handed the dsime_tsf.dll directory.
+        ExtractResource(IDR_DICT, dst + L"\\dsime.lex",        &err);
 
     if (ok) {
         PostProgress(dlg, L"Registering the text service…");

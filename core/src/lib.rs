@@ -6,11 +6,19 @@ mod api;
 mod config;
 mod context;
 mod engine;
+pub mod lexicon;
 
 pub use engine::{Engine, EngineHandle, Session};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
+
+// Status codes, mirroring the `#define`s in `core/include/dsime.h`. The ones the
+// conversion callback uses come from `api::ConvertError::status_code`; these are
+// the synchronous entry points, which return them directly.
+const DS_OK: i32 = 0;
+const DS_ERR_CONFIG: i32 = 5;
+const DS_ERR_INTERNAL: i32 = 6;
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
@@ -35,6 +43,19 @@ fn to_c_string(s: impl Into<Vec<u8>>) -> *mut c_char {
         Ok(c) => c.into_raw(),
         Err(_) => ptr::null_mut(),
     }
+}
+
+/// Same, for a payload that legitimately contains NULs — a NUL-separated list.
+///
+/// `CString::new` rejects interior NULs, which is the right default but exactly
+/// wrong here, so the terminator is appended by hand. Sound because the buffer is
+/// a live `Vec` from the global allocator, `ManuallyDrop` stops it being freed
+/// twice, and the byte we just pushed guarantees the NUL `from_raw` requires.
+fn to_c_string_list(mut bytes: Vec<u8>) -> *mut c_char {
+    bytes.push(0);
+    let mut v = std::mem::ManuallyDrop::new(bytes);
+    // SAFETY: see above — `v` owns the buffer, ends in 0, and is never used again.
+    unsafe { CString::from_raw(v.as_mut_ptr() as *mut c_char) }.into_raw()
 }
 
 // ---- Engine lifecycle ------------------------------------------------------
@@ -412,6 +433,353 @@ pub unsafe extern "C" fn ds_session_cancel(session: *mut Session) {
 pub unsafe extern "C" fn ds_session_reset(session: *mut Session) {
     if let Some(s) = session_ref(session) {
         s.reset();
+    }
+}
+
+// ---- Lexicon ----------------------------------------------------------------
+//
+// Stateless segmentation and candidate lookup over the compiled dictionary.
+// Nothing here touches a `DsSession` or the conversion queue: the single-flight
+// rule in `engine.rs` exists because a request is in flight, and these calls
+// start none. The frontend calls them on every keystroke to draw the candidate
+// row, which is why they must stay allocation-light and must never fail hard —
+// a missing dictionary degrades to "one opaque segment", the behaviour the IME
+// had before this existed.
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use lexicon::{Lexicon, MAX_CANDIDATES};
+
+/// The process-wide dictionary, opened on first use.
+static LEXICON: OnceLock<Option<Lexicon>> = OnceLock::new();
+
+thread_local! {
+    /// Set by `ds_lexicon_set_path` before the dictionary is first mapped. A
+    /// thread-local so a frontend that never sets a path does not race one that
+    /// does, and so the `OnceLock` is never initialised from a bare default.
+    static LEXICON_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Opaque handle: one buffer's segmentation, owned by the caller.
+///
+/// Everything the C side can read is held here as a [`CString`], never as a
+/// borrowed `&str` or a slice of the mapping. A `*const c_char` return is a
+/// promise that there is a NUL after the text, and Rust's `String` does not keep
+/// one: handing out `s.as_ptr()` and letting `CStr::from_ptr` run to the next
+/// zero byte reads past the end of the allocation into whatever the allocator
+/// left there. It usually looks fine, which is what makes it worth stating.
+/// The copies are a few dozen short strings per keystroke, and they also make the
+/// handle self-contained — the caller can hold one across dictionary changes.
+pub struct DsSegResult {
+    /// NUL-terminated pinyin per segment; empty for one with no dictionary entry,
+    /// in which case it is the raw input slice instead.
+    pinyin: Vec<CString>,
+    /// Byte offsets of each segment within the string passed to
+    /// `ds_lexicon_segment`. Kept because a code is *not* a span: "mei you" is 8
+    /// bytes of code for 6 bytes of buffer, and taking a candidate has to consume
+    /// the span or nothing is selected at all.
+    span: Vec<(u32, u32)>,
+    /// NUL-terminated best word per segment; empty when there is none.
+    best: Vec<CString>,
+    has_word: Vec<bool>,
+    /// Candidates per segment, computed on demand. Only the segment the user can
+    /// act on is ever asked for, so this stays empty for the rest of a long
+    /// buffer.
+    cands: RefCell<Vec<Vec<CString>>>,
+}
+
+/// The dictionary, mapping it on first use.
+fn lexicon() -> Option<&'static Lexicon> {
+    LEXICON
+        .get_or_init(|| {
+            let path = LEXICON_PATH
+                .with(|p| p.borrow().clone())
+                .unwrap_or_else(default_lexicon_path);
+            match Lexicon::open(&path) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    // Not fatal and not worth an error dialog: the IME simply has
+                    // no candidates, which is how it behaved before this feature
+                    // existed. Logged so that a user reporting "no candidates"
+                    // has something to correlate.
+                    eprintln!("dsime: lexicon unavailable ({}): {e}", path.display());
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Where the lexicon lives when the frontend did not say: beside the config
+/// file, which is the one path the core already knows how to find.
+fn default_lexicon_path() -> PathBuf {
+    config::Config::default_path()
+        .parent()
+        .map_or_else(|| PathBuf::from("dsime.lex"), |d| d.join("dsime.lex"))
+}
+
+/// # Safety
+/// `utf8_path` is NULL or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ds_lexicon_set_path(utf8_path: *const c_char) -> i32 {
+    let Some(s) = cstr(utf8_path) else {
+        set_last_error("ds_lexicon_set_path: NULL path");
+        return DS_ERR_CONFIG;
+    };
+    // Refuse once mapped. Silently accepting it would produce the worst kind of
+    // bug: a frontend that believes it configured the dictionary, and a process
+    // that quietly kept using the one it found first.
+    if LEXICON.get().is_some() {
+        set_last_error("ds_lexicon_set_path: the dictionary is already mapped");
+        return DS_ERR_CONFIG;
+    }
+    LEXICON_PATH.with(|p| *p.borrow_mut() = Some(PathBuf::from(s)));
+    DS_OK
+}
+
+#[no_mangle]
+pub extern "C" fn ds_lexicon_available() -> i32 {
+    i32::from(lexicon().is_some())
+}
+
+/// # Safety
+/// `pinyin_utf8` is NULL or valid NUL-terminated UTF-8; `out` is a valid pointer
+/// to a writable `DsSegResult*`.
+#[no_mangle]
+pub unsafe extern "C" fn ds_lexicon_segment(
+    pinyin_utf8: *const c_char,
+    out: *mut *mut DsSegResult,
+) -> i32 {
+    if out.is_null() {
+        set_last_error("ds_lexicon_segment: NULL out");
+        return DS_ERR_INTERNAL;
+    }
+    let input = cstr(pinyin_utf8).unwrap_or("").to_owned();
+    // Degrade, never fail: with no dictionary the whole buffer becomes one opaque
+    // span, so the caller's "does this segment have candidates?" test simply says
+    // no and the UI draws no candidate row.
+    let segments = match lexicon() {
+        Some(l) => l.segment(&input),
+        None => vec![lexicon::Segment {
+            start: 0,
+            end: input.len(),
+            pinyin: input,
+            best: None,
+        }],
+    };
+    let mut pinyin = Vec::with_capacity(segments.len());
+    let mut best = Vec::with_capacity(segments.len());
+    let mut has_word = Vec::with_capacity(segments.len());
+    let mut span = Vec::with_capacity(segments.len());
+    for s in &segments {
+        pinyin.push(nul(s.pinyin.as_str()));
+        has_word.push(s.is_selectable());
+        best.push(nul(s.best.as_deref().unwrap_or("")));
+        span.push((s.start as u32, s.end as u32));
+    }
+    *out = Box::into_raw(Box::new(DsSegResult {
+        pinyin,
+        span,
+        best,
+        has_word,
+        cands: RefCell::new(Vec::new()),
+    }));
+    DS_OK
+}
+
+/// A NUL-terminated copy. Words and codes never contain an interior NUL, so the
+/// only failure path is a caller handing us something impossible.
+fn nul(s: &str) -> CString {
+    CString::new(s).unwrap_or_default()
+}
+
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_lexicon_free(result: *mut DsSegResult) {
+    if !result.is_null() {
+        drop(Box::from_raw(result));
+    }
+}
+
+/// Borrow the segment's pinyin at `index`, or NULL. Out-of-range and negative
+/// indices are refused rather than clamped: a caller walking past the end is a
+/// bug worth seeing, and a clamped index would hand back a plausible-looking
+/// wrong word.
+unsafe fn slot(v: &[CString], index: i32) -> Option<&CString> {
+    if index < 0 {
+        return None;
+    }
+    v.get(index as usize)
+}
+
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_seg_count(result: *const DsSegResult) -> i32 {
+    result.as_ref().map_or(0, |r| r.pinyin.len() as i32)
+}
+
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_seg_pinyin(result: *const DsSegResult, index: i32) -> *const c_char {
+    result
+        .as_ref()
+        .and_then(|r| slot(&r.pinyin, index))
+        .map_or(ptr::null(), |s| s.as_ptr())
+}
+
+/// Byte offset of the segment's first letter within the string that was
+/// segmented — *not* within the code. See [`ds_seg_pinyin`].
+///
+/// Returns -1 for an out-of-range index. An empty `end` (a valid index on a
+/// zero-length segment, which cannot happen today) is 0.
+///
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_seg_start(result: *const DsSegResult, index: i32) -> i32 {
+    result
+        .as_ref()
+        .and_then(|r| {
+            if index < 0 {
+                None
+            } else {
+                r.span.get(index as usize)
+            }
+        })
+        .map_or(-1, |s| s.0 as i32)
+}
+
+/// Byte offset one past the segment's last letter, in the same buffer
+/// [`ds_seg_start`] indexes. `end - start` is the segment's length in the
+/// caller's own string.
+///
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_seg_end(result: *const DsSegResult, index: i32) -> i32 {
+    result
+        .as_ref()
+        .and_then(|r| {
+            if index < 0 {
+                None
+            } else {
+                r.span.get(index as usize)
+            }
+        })
+        .map_or(-1, |s| s.1 as i32)
+}
+
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_seg_has_word(result: *const DsSegResult, index: i32) -> i32 {
+    result
+        .as_ref()
+        .and_then(|r| {
+            if index < 0 {
+                None
+            } else {
+                r.has_word.get(index as usize)
+            }
+        })
+        .copied()
+        .map_or(0, i32::from)
+}
+
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_seg_best(result: *const DsSegResult, index: i32) -> *const c_char {
+    result
+        .as_ref()
+        .and_then(|r| slot(&r.best, index))
+        .filter(|s| !s.as_bytes().is_empty())
+        .map_or(ptr::null(), |s| s.as_ptr())
+}
+
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_seg_cand_count(result: *const DsSegResult, index: i32) -> i32 {
+    if index < 0 {
+        return 0;
+    }
+    let Some(r) = result.as_ref() else { return 0 };
+    r.cache(index as usize);
+    r.cands.borrow().get(index as usize).map_or(0, Vec::len) as i32
+}
+
+/// # Safety
+/// `result` came from `ds_lexicon_segment` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn ds_seg_cand(
+    result: *const DsSegResult,
+    index: i32,
+    n: i32,
+) -> *const c_char {
+    if index < 0 || n < 0 {
+        return ptr::null();
+    }
+    let Some(r) = result.as_ref() else {
+        return ptr::null();
+    };
+    r.cache(index as usize);
+    let cands = r.cands.borrow();
+    cands
+        .get(index as usize)
+        .and_then(|v| v.get(n as usize))
+        .map_or(ptr::null(), |s| s.as_ptr())
+}
+
+/// # Safety
+/// `code_utf8` is NULL or valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn ds_lexicon_candidates(code_utf8: *const c_char) -> *mut c_char {
+    let Some(code) = cstr(code_utf8) else {
+        return ptr::null_mut();
+    };
+    let Some(l) = lexicon() else {
+        return ptr::null_mut();
+    };
+    let words = l.candidates(code);
+    if words.is_empty() {
+        return ptr::null_mut();
+    }
+    // NUL-separated and double-NUL-terminated: one allocation, and the C side
+    // walks it without needing the count up front. Caller frees.
+    let mut blob: Vec<u8> = Vec::new();
+    for w in &words {
+        blob.extend_from_slice(w.as_bytes());
+        blob.push(0);
+    }
+    to_c_string_list(blob)
+}
+
+impl DsSegResult {
+    /// Fill in segment `i`'s candidate list on first ask.
+    fn cache(&self, i: usize) {
+        let mut cands = self.cands.borrow_mut();
+        if cands.len() < self.pinyin.len() {
+            cands.resize_with(self.pinyin.len(), Vec::new);
+        }
+        if !cands[i].is_empty() {
+            return;
+        }
+        // A segment with no dictionary entry has no candidates by definition;
+        // asking again would only re-run the lookup to get the same nothing.
+        cands[i] = match lexicon() {
+            Some(l) if self.has_word[i] => l
+                .candidates(&self.pinyin[i].to_string_lossy())
+                .into_iter()
+                .map(|w| nul(&w))
+                .collect(),
+            _ => Vec::new(),
+        };
+        debug_assert!(cands[i].len() <= MAX_CANDIDATES);
     }
 }
 

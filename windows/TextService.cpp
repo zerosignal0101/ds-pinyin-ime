@@ -104,6 +104,12 @@ STDMETHODIMP CTextService::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD 
         _maxPending = _engine.QueueMaxPending();
     }
 
+    // 1b) The dictionary for segmentation and candidate selection. Independent
+    //     of the engine: a missing dsime.lex costs candidates, not conversion, so
+    //     this must not be inside the `if (_engine.valid())` above. It only reads
+    //     the filesystem, and is a no-op after the first activation in the process.
+    _InitLexicon();
+
     // 2) Hidden message-only window must exist before any conversion can post
     //    back to us. Created on THIS (the STA) thread, so its window proc runs
     //    here.

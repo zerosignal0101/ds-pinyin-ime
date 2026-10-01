@@ -152,9 +152,138 @@ void CTextService::_ClearTyping() {
     // the user already committed with Space, and resetting cancels in-flight
     // work. The buffer the core converts is set per job, in _PumpQueue.
     _pinyin.clear();
+    // Chosen words go with the buffer: they are annotations ON the pinyin, not
+    // text in the document, so nothing about them survives a commit or an Esc.
+    _chosen.clear();
+    _Resegment();
     _composing = false;
     _writeFailed = false;
     _UpdateInputBox();
+}
+
+// ---- word selection ---------------------------------------------------------
+
+void CTextService::_InitLexicon() {
+    // Once per process, before the first query. The core refuses a second call
+    // rather than pretending to accept it, so a re-activation must not make one.
+    static bool s_tried = false;
+    if (s_tried) return;
+    s_tried = true;
+
+    // Beside this DLL. Not the host's directory: we are loaded *into* the host,
+    // so current_exe would name notepad.exe, and not the working directory
+    // either. regsvr32 recorded the exact path this DLL was registered from, and
+    // dsime.lex installs next to it, so this is the one location guaranteed to
+    // be the right one.
+    wchar_t self[MAX_PATH] = {};
+    HMODULE mod = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&DsimeTrace), &mod) ||
+        ::GetModuleFileNameW(mod, self, MAX_PATH) == 0) {
+        DsimeTrace(L"lexicon: cannot locate our own module; running without candidates");
+        return;
+    }
+    std::wstring dir(self);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return;
+    dir.resize(slash + 1);
+    const std::wstring lex = dir + L"dsime.lex";
+
+    if (!dsime::LexiconSetPath(dsime::Utf16ToUtf8(lex))) {
+        DsimeTrace(L"lexicon: set_path refused (already mapped?): %s",
+                   dsime::Utf16ToUtf8(dsime::LastError()).c_str());
+        return;
+    }
+    DsimeTrace(L"lexicon: available=%d path=%s", dsime::LexiconAvailable() ? 1 : 0,
+               dsime::Utf16ToUtf8(lex).c_str());
+}
+
+void CTextService::_Resegment() {
+    _cands.clear();
+    _activeStart = 0;
+    _activeLen = 0;
+    if (_pinyin.empty()) {
+        _segs.Free();
+        return;
+    }
+    if (!_segs.Segment(_pinyin)) return;
+
+    // The actionable segment is the FIRST one: the traditional behaviour, where
+    // picking a word advances the cursor to the next. Only that one gets a
+    // candidate list — the rest would be fetched, formatted and never drawn.
+    for (int32_t i = 0; i < _segs.count(); ++i) {
+        if (!_segs.HasWord(i)) continue;  // digits, capitals, unknown names
+        const int32_t n = _segs.CandCount(i);
+        if (n <= 0) continue;
+        // A span in the buffer, NOT the code. "mei you" is 8 bytes and the
+        // letters the user typed are 6, so sizing the deletion off the code
+        // silently refuses every multi-syllable word — which is nearly all of
+        // them. Single-syllable words only ever worked because their code
+        // happens to equal the input.
+        const int32_t start = _segs.Start(i);
+        const int32_t end = _segs.End(i);
+        if (start < 0 || end <= start || static_cast<size_t>(end) > _pinyin.size()) continue;
+        // Anything the core could not parse ahead of the active segment — an
+        // unmatched run, a comma the user typed mid-sentence — is consumed along
+        // with it, because the deletion is from the front and a hole in the
+        // middle would leave the segmenter looking at what is no longer a word
+        // boundary. "Consumed" is not "dropped": _SelectCandidate carries that run
+        // into the chosen word's text so it keeps its place in the payload.
+        _activeStart = static_cast<size_t>(start);
+        _activeLen = static_cast<size_t>(end);
+        _cands.reserve(static_cast<size_t>(n));
+        for (int32_t c = 0; c < n; ++c) {
+            _cands.push_back(_segs.Cand(i, c));
+        }
+        break;
+    }
+}
+
+std::string CTextService::_ConversionPayload() const {
+    // Direct concatenation, no separator. The chosen words are Chinese and the
+    // tail is pinyin, and the system prompt's mixed-input rule is what tells the
+    // model to keep the Chinese verbatim and convert the rest.
+    std::string out;
+    for (const ChosenWord& w : _chosen) out += w.text;
+    out += _pinyin;
+    return out;
+}
+
+bool CTextService::_SelectCandidate(size_t n) {
+    if (n >= _cands.size() || _activeLen == 0) return false;
+    if (_activeLen > _pinyin.size()) return false;
+    ChosenWord w;
+    // The exact bytes consumed, so Backspace restores the buffer verbatim. Storing
+    // the code here instead would splice a spaced "mei you" into the middle of
+    // the next segment's letters and the whole thing would re-segment as garbage.
+    w.pinyin = _pinyin.substr(0, _activeLen);
+    // Whatever sits in FRONT of the active segment is not part of the word, and it
+    // cannot simply be dropped either: the payload is the chosen words concatenated
+    // in selection order, so a leading run that is discarded here comes back out
+    // in the wrong place. Type `nihao,shijie`, choose 你好, then choose 世界 — the
+    // comma is now the first thing in the buffer, and the active segment starts at
+    // offset 1, so a choice that took only the word produced "你好世界" and the
+    // comma was gone. Carrying the run as part of this word's text puts it back
+    // exactly where it was typed: "你好,世界".
+    w.text = _pinyin.substr(0, _activeStart) + _cands[n];
+    _chosen.push_back(w);
+    _pinyin.erase(0, _activeLen);
+    _Resegment();
+    return true;
+}
+
+bool CTextService::_UndoLastChoice() {
+    if (_chosen.empty()) return false;
+    // Backspace on a chosen word reverts the choice rather than deleting a
+    // character: nothing was written to the document, so there is no character to
+    // delete — the word is an annotation on the buffer, and putting its pinyin
+    // back is the only undo that matches what the user sees.
+    const ChosenWord w = _chosen.back();
+    _chosen.pop_back();
+    _pinyin += w.pinyin;
+    _Resegment();
+    return true;
 }
 
 void CTextService::_ReanchorIfComposing(ITfContext* pic) {
@@ -228,7 +357,8 @@ void CTextService::_UpdateInputBox(bool canProbeCaret) {
     // box is presentation and this is the state), but they must agree, and a
     // state added to one without the other shows up as a box that will not go
     // away or a flash that never appears.
-    if (_pinyin.empty() && _PendingConversions() == 0 && !_writeFailed && !_modeFlash) {
+    if (_pinyin.empty() && _chosen.empty() && _PendingConversions() == 0 && !_writeFailed &&
+        !_modeFlash) {
         // Idle. Skip the caret probe below — that is a synchronous edit session,
         // and the layout timer would otherwise run one six times a second for
         // nothing.
@@ -236,9 +366,18 @@ void CTextService::_UpdateInputBox(bool canProbeCaret) {
         _inputBox->Hide();
         return;
     }
-    DsimeTrace(L"box: show pinyin=%u pending=%u jobs=%u failed=%d composing=%d english=%d "
-               L"flash=%d",
-               static_cast<unsigned>(_pinyin.size()),
+    // The pre-edit line shows the WHOLE buffer, not just the unselected tail: a
+    // chosen word is already Chinese and is part of what Space will send, so
+    // leaving it out would make the box misreport the payload. This is also why
+    // the idle test above has to consider `_chosen` — a buffer of nothing but
+    // chosen words is not idle, it is waiting for a Space that costs no call.
+    // The line itself is _PreEditText() rather than the payload: same words, but
+    // the pinyin half broken into syllables.
+    std::wstring shown = dsime::Utf8ToUtf16(_PreEditText());
+    DsimeTrace(L"box: show pinyin=%u chosen=%zu cands=%u pending=%u jobs=%u failed=%d "
+               L"composing=%d english=%d flash=%d",
+               static_cast<unsigned>(_pinyin.size()), _chosen.size(),
+               static_cast<unsigned>(_cands.size()),
                static_cast<unsigned>(_PendingConversions()),
                static_cast<unsigned>(_jobs.size()),
                static_cast<int>(_writeFailed), static_cast<int>(_composing),
@@ -261,8 +400,40 @@ void CTextService::_UpdateInputBox(bool canProbeCaret) {
     // Mode before content: SetContent can hide the box, and SetMode can bring it
     // back, so doing it the other way round would flash a stale frame.
     _inputBox->SetMode(_englishMode, _modeFlash);
-    _inputBox->SetContent(dsime::Utf8ToUtf16(_pinyin),
-                          static_cast<unsigned>(_PendingConversions()), _writeFailed);
+    // UTF-8 -> UTF-16 once, here: the box is wide-only and never sees the
+    // multibyte form, so the candidate list cannot be half-converted anywhere.
+    std::vector<std::wstring> candText;
+    candText.reserve(_cands.size());
+    for (const std::string& c : _cands) candText.push_back(dsime::Utf8ToUtf16(c));
+    _inputBox->SetContent(shown, static_cast<unsigned>(_PendingConversions()), _writeFailed,
+                          candText);
+}
+
+std::string CTextService::_PreEditText() const {
+    // DISPLAY ONLY. Space still sends _ConversionPayload() — the words the user
+    // chose and the remaining pinyin concatenated with nothing between them,
+    // because that is what the system prompt's mixed-input rule describes.
+    //
+    // What goes on screen is a different string for one reason: "nihaoshijie" is
+    // not something a person can read, and the whole basis for pressing a digit
+    // is a guess about where the syllables are. The candidate list is the
+    // segmentation's opinion, and this line is the same opinion drawn — the one
+    // place the user can see "it read that as ni hao shi jie, so it is offering
+    // 你好" and decide whether to accept it. Separators therefore come from the
+    // segments the core just returned, never from re-deriving syllables here.
+    std::string out;
+    for (const ChosenWord& w : _chosen) out += w.text;
+    if (_pinyin.empty()) return out;
+    if (!out.empty()) out += ' ';
+    // No segmentation (no dictionary, or a buffer changed without a resegment):
+    // show the letters. A word per segment would be better than this, but
+    // inventing a reading the core never produced is worse than none.
+    if (!_segs.valid() || _segs.count() <= 0) return out + _pinyin;
+    for (int32_t i = 0; i < _segs.count(); ++i) {
+        if (i > 0) out += ' ';
+        out += _segs.Pinyin(i);
+    }
+    return out;
 }
 
 std::string CTextService::_ContextKeyForFocus() {

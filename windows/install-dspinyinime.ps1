@@ -3,7 +3,10 @@
 # Mirrors what windows/installer/DSPinyinIMEInstaller.cpp does at runtime:
 #   1. Copy the trio (dsime.dll, dsime_tsf.dll, DSPinyinIMESettings.exe) into
 #      %ProgramFiles%\DS Pinyin IME — all three must co-locate (the DLLs load dsime.dll
-#      at runtime), and regsvr32 records the exact path it registers from.
+#      at runtime), and regsvr32 records the exact path it registers from. The
+#      compiled dictionary (dsime.lex) lands there too and must co-locate with
+#      them, but is optional: without it the IME has no candidates, which is a
+#      supported state.
 #   2. regsvr32 the text service: DllRegisterServer writes HKCR\CLSID
 #      InprocServer32 + the TSF profile/categories for zh-Hans (0x0804).
 #   3. Add the TIP id to the user's zh language list so it is selectable with
@@ -86,9 +89,23 @@ function Remove-StaleAside {
     return $n
 }
 
+# The lexicon (dsime.lex) is optional, unlike the other three: without it the IME
+# runs with no candidate list, which is a supported state and exactly how it
+# behaved before segmentation existed. So its absence must not fail an install —
+# only the trio is required.
 $files = @("dsime.dll", "dsime_tsf.dll", "DSPinyinIMESettings.exe")
 foreach ($f in $files) {
     if (-not (Test-Path (Join-Path $Src $f))) { throw "missing $f under $Src — run build.ps1 first." }
+}
+
+# build.ps1 stages the lexicon one level up, because it is architecture-
+# independent (a table of UTF-8 words) and duplicating ~22 MB per arch would be
+# waste. Look beside the binaries first so a hand-assembled $Src still works.
+$LexSrc = Join-Path $Src "dsime.lex"
+if (-not (Test-Path $LexSrc)) { $LexSrc = Join-Path (Split-Path -Parent $Src) "dsime.lex" }
+$haveLexicon = Test-Path $LexSrc
+if (-not $haveLexicon) {
+    Write-Warning "dsime.lex not found — installing WITHOUT segmentation and candidate selection."
 }
 
 # ── 1. Copy the trio ────────────────────────────────────────────────────────
@@ -104,8 +121,12 @@ if ($dropped -gt 0) { Log "   withdrew $dropped stale reboot-delete entry/entrie
 $swept = Remove-StaleAside $Dst
 if ($swept -gt 0) { Log "   swept $swept leftover *.old file(s)" }
 $swapped = @()
-foreach ($f in $files) {
-    $source = Join-Path $Src $f
+# The lexicon goes through the same copy-or-rename-aside dance, because it is
+# memory-mapped by every running host that has the IME active — a mapped file
+# cannot be overwritten either. It is not in $files, so its absence is tolerated.
+foreach ($f in ($files + $(if ($haveLexicon) { "dsime.lex" } else { @() }))) {
+    # The lexicon was found one level up, not in $Src.
+    $source = if ($f -eq "dsime.lex") { $LexSrc } else { Join-Path $Src $f }
     $target = Join-Path $Dst $f
     try {
         Copy-Item $source $target -Force -ErrorAction Stop

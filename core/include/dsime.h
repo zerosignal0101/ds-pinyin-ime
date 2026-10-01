@@ -203,6 +203,103 @@ const char *ds_last_error(void); /* thread-local last error, never NULL */
 /* SemVer of the core library (static string, do not free). */
 const char *ds_version(void);
 
+/* ---- Lexicon (segmentation + candidate lookup) ----------------------------
+ *
+ * A local pinyin dictionary, compiled ahead of time into `dsime.lex` (the `dslex`
+ * tool, from rime-frost) and memory-mapped read-only on first use. It gives the
+ * IME a candidate list while the user is still typing, so a short word does not
+ * need a round trip to the model.
+ *
+ * These calls are STATELESS and independent of DsSession: they do not touch the
+ * conversion queue, do not start a request, and are safe to call on every
+ * keystroke. Nothing here is tied to the single-flight rule that governs
+ * ds_session_convert — that rule exists because a request is in flight, and these
+ * have none.
+ *
+ * Every one of them degrades rather than fails. If the dictionary is missing,
+ * unreadable, or built by a different version, ds_lexicon_available() reports 0
+ * and ds_lexicon_segment() returns a single opaque segment, which is exactly how
+ * the IME behaved before this feature existed. Callers need no fallback path of
+ * their own.
+ *
+ * Threading: the shared dictionary is opened under a one-time initialiser and is
+ * read-only afterwards, so any thread may query it. A DsSegResult handle,
+ * however, is owned by the caller that received it and is not thread-safe; in
+ * practice it lives and dies on the STA thread within one key event. */
+
+typedef struct DsSegResult DsSegResult;
+
+/* Point the lexicon at its data file. Absolute path, UTF-8.
+ *
+ * Call once, during activation, BEFORE the first query — a call made after the
+ * dictionary is already mapped returns DS_ERR_CONFIG and changes nothing rather
+ * than silently appearing to take effect. The frontend passes the path next to
+ * dsime.dll, since the DLL, the settings EXE and the lexicon must all be
+ * co-located (regsvr32 records the exact path it registered from).
+ *
+ * If this is never called, the path is derived from the config file's directory,
+ * which is what the CLI example and the tests rely on. */
+int32_t    ds_lexicon_set_path(const char *utf8_path);
+
+/* 1 if a dictionary was found and mapped, 0 if the IME must run without one. */
+int32_t    ds_lexicon_available(void);
+
+/* Segment a pinyin buffer. `pinyin_utf8` is the raw ASCII the user has typed that
+ * has not been selected yet — digits, punctuation and capitals are all allowed
+ * and come back as opaque segments that can never be selected.
+ *
+ * On success writes a handle to *out and returns DS_OK. `*out` is NULL on
+ * failure. Free it with ds_lexicon_free. */
+int32_t    ds_lexicon_segment(const char *pinyin_utf8, DsSegResult **out);
+
+void       ds_lexicon_free(DsSegResult *result);
+
+int32_t    ds_seg_count(const DsSegResult *result);
+
+/* The segment's code — space-joined syllables, which is the key to pass back to
+ * ds_lexicon_candidates. For a segment with no dictionary entry this is the raw
+ * input slice instead, and ds_seg_has_word() is 0.
+ *
+ * THIS IS NOT THE SEGMENT'S LENGTH IN THE BUFFER. "meiyou" has the code "mei you"
+ * (8 bytes) and the span "meiyou" (6 bytes): a code is what the dictionary is keyed
+ * by, a span is what the user typed. To take a candidate you need the span, and
+ * ds_seg_start/ds_seg_end are what give it to you. */
+const char *ds_seg_pinyin(const DsSegResult *result, int32_t index);
+
+/* Byte offsets of segment `index` within the string passed to
+ * ds_lexicon_segment: [start, end). Together they are how much of the buffer a
+ * selected word consumes, which is almost never strlen(code) — a multi-syllable
+ * code carries separator spaces the input does not, and an apostrophe the user
+ * typed is in the span but not in the code.
+ *
+ * Read them from the SAME result handle, and re-read them on every keystroke: the
+ * segmentation is recomputed as the user types, and a length remembered from an
+ * earlier one would slice the wrong bytes. */
+int32_t    ds_seg_start(const DsSegResult *result, int32_t index);
+int32_t    ds_seg_end(const DsSegResult *result, int32_t index);
+
+/* 1 if the dictionary matched this segment, so it can be selected. */
+int32_t    ds_seg_has_word(const DsSegResult *result, int32_t index);
+
+/* Highest-weighted word for the segment — candidate #1 — or NULL. */
+const char *ds_seg_best(const DsSegResult *result, int32_t index);
+
+/* How many candidates this segment has, 0..8. A short code simply reports fewer;
+ * the list is never padded. */
+int32_t    ds_seg_cand_count(const DsSegResult *result, int32_t index);
+
+/* Candidate `n` (0-based) of segment `index`, or NULL.
+ *
+ * The UI labels these from 2, not 1: candidate 0 is shown as `2`. There is no
+ * label 1, and the digit key 1 never selects a candidate. */
+const char *ds_seg_cand(const DsSegResult *result, int32_t index, int32_t n);
+
+/* Candidates for a code, highest weight first, at most 8, as a NUL-separated,
+ * double-NUL-terminated block. The caller frees it with ds_string_free. Returns
+ * NULL if the code is unknown. Provided so a frontend can fetch a list without
+ * holding a whole segmentation — useful when only the active segment is wanted. */
+char      *ds_lexicon_candidates(const char *code_utf8);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

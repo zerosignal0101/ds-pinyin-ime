@@ -2,8 +2,11 @@
 #
 # For each requested arch it:
 #   1. Builds the Rust core (dsime) for the MSVC target -> dsime.dll + import lib.
-#   2. Configures + builds the C++ TSF DLL and settings exe with CMake (VS 2022).
-#   3. Stages the trio (dsime_tsf.dll, dsime.dll, DSPinyinIMESettings.exe) under
+#   2. Compiles the dictionary (dsime.lex) from the rime-frost sources, if they are
+#      present. It is architecture-INDEPENDENT, so it is written once into dist/
+#      regardless of how many arches were asked for.
+#   3. Configures + builds the C++ TSF DLL and settings exe with CMake (VS 2022).
+#   4. Stages the trio (dsime_tsf.dll, dsime.dll, DSPinyinIMESettings.exe) under
 #      windows/dist/<arch>/ — the layout the installer bundles from.
 #
 # Run from a "x64 Native Tools Command Prompt for VS 2022" (PowerShell) or any
@@ -13,6 +16,7 @@
 #   ./build.ps1                       # build every supported arch (x64 + arm64)
 #   ./build.ps1 -Arch x64             # just one
 #   ./build.ps1 -Arch arm64 -Config Debug
+#   ./build.ps1 -Arch x64 -SkipLexicon   # dist/dsime.lex is already built (CI)
 #
 # A requested arch whose Rust target or MSVC compiler is missing is skipped with
 # a warning (so an x64-only CI runner still produces the x64 build).
@@ -29,7 +33,15 @@ param(
     # passes "Ninja": a single-config generator that takes the target arch from the
     # ambient MSVC environment (set up by, e.g., ilammy/msvc-dev-cmd) — so build one
     # arch per invocation with the matching env active.
-    [string]$Generator = "Visual Studio 17 2022"
+    [string]$Generator = "Visual Studio 17 2022",
+    # The dictionary (dsime.lex) is already in windows/dist/ — do not recompile it.
+    # CI restores a prebuilt one from a cache keyed on the rime-frost commit and
+    # recompiling costs 2-3 minutes per job for a file that is a pure function of
+    # those sources. A MISSING file is an error, not a fallback: the whole point of
+    # asking for this switch is that the dictionary is accounted for, and the
+    # ordinary degradation (no sources -> no candidates) has to stay something that
+    # happens by accident and visibly, never something you requested.
+    [switch]$SkipLexicon
 )
 
 $ErrorActionPreference = "Stop"
@@ -84,6 +96,49 @@ foreach ($a in $Selected) {
     if (-not (Test-Path (Join-Path $CoreOut "dsime.dll"))) {
         Write-Warning "skipping $a — core did not produce dsime.dll."
         continue
+    }
+
+    # The dictionary for segmentation and candidate selection (dsime.lex).
+    #
+    # Architecture-INDEPENDENT: it is a table of UTF-8 words, so one copy serves
+    # every arch. Regenerated whenever the sources are found — a `Test-Path` guard
+    # would be faster by a few seconds and would silently ship a stale dictionary
+    # after anyone edits one, which is the one mistake worth spending them to
+    # avoid. Built only if the source dictionaries are present: without rime-frost
+    # the build still succeeds and the IME runs without candidates, a supported
+    # state.
+    $LexPath = Join-Path $DistDir "dsime.lex"
+    $rime = $env:DSIME_RIME_DIR
+    if (-not $rime) { $rime = Join-Path (Split-Path $CoreDir -Parent) "rime-frost" }
+    $sources = @("base", "ext", "8105") | ForEach-Object {
+        Join-Path $rime "cn_dicts/$_.dict.yaml"
+    }
+    $missing = $sources | Where-Object { -not (Test-Path $_) }
+    if ($SkipLexicon) {
+        if (-not (Test-Path $LexPath)) {
+            throw "-SkipLexicon was given but $LexPath does not exist. Refusing to stage a " +
+                  "build whose IME has no candidates — that is the failure this switch is meant to rule out."
+        }
+        Write-Host "==> lexicon: reusing $LexPath (-SkipLexicon)" -ForegroundColor Cyan
+    } elseif ($missing.Count -gt 0) {
+        Write-Host "    lexicon: sources not found under $rime — building without candidates" -ForegroundColor DarkYellow
+        Write-Host "             (set `$env:DSIME_RIME_DIR, or pass the .dict.yaml paths to dslex)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "==> lexicon (dsime.lex, arch-independent)" -ForegroundColor Cyan
+        Push-Location $CoreDir
+        try {
+            $lexArgs = @("run", "--bin", "dslex", "--target", $triple)
+            if ($Config -eq "Release") { $lexArgs += "--release" }
+            $lexArgs += @("--", $LexPath) + $sources
+            cargo @lexArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "dslex failed (exit $LASTEXITCODE)"
+            }
+        } catch {
+            Pop-Location
+            Write-Warning "lexicon not built — the IME will run without candidates: $_"
+        }
+        Pop-Location
     }
 
     Write-Host "==> [$a] C++ (CMake, $Generator, $cmakeA)" -ForegroundColor Cyan

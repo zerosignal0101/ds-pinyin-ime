@@ -151,7 +151,7 @@ $swept = Remove-StaleAside $InstallDir
 if ($swept -gt 0) { Log "   swept $swept leftover *.old file(s)" }
 # The installer self-copies, so it is in here too and is the one file that is
 # always running while we try to delete it.
-$files = @("dsime.dll", "dsime_tsf.dll", "DSPinyinIMESettings.exe", "DSPinyinIMEInstaller.exe")
+$files = @("dsime.dll", "dsime_tsf.dll", "DSPinyinIMESettings.exe", "DSPinyinIMEInstaller.exe", "dsime.lex")
 $aside = @()
 foreach ($f in $files) {
     $target = Join-Path $InstallDir $f

@@ -48,6 +48,62 @@ pub const LEGACY_TIMEOUT_MS: &[u64] = &[8000];
 // there means the edit reaches nobody.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 Convert toneless Hanyu Pinyin into the single most natural sentence. The input \
+may MIX pinyin with English words, numbers, emails, URLs, code identifiers, and \
+already-chosen Chinese: convert the pinyin parts to Chinese and keep the rest \
+verbatim. Use spaces and context to tell pinyin from English; an apostrophe only \
+marks a pinyin syllable boundary (xi'an = 西安).\n\
+Rules:\n\
+- Output ONLY the result: no explanation, quotes, extra whitespace, or \
+alternatives.\n\
+- Convert pinyin to Chinese; keep English words, numbers, emails, URLs, and code \
+identifiers exactly as written.\n\
+- Chinese characters already in the input are words the user picked from a local \
+dictionary one at a time. Keep every one of them EXACTLY as written — do not \
+re-convert, re-order, correct, or drop them — and convert only the pinyin around \
+them. There is no separator between the two parts, so a leading or trailing run \
+of Chinese is normal and is not a sentence fragment to fix up.\n\
+- A run of two or more UPPER-CASE letters (AI, ICT, PDF, URL) is an English \
+abbreviation: keep it exactly as written and never read it as pinyin. A lower-case \
+run is pinyin, as usual.\n\
+- Use full-width Chinese punctuation amid Chinese; keep ASCII punctuation inside \
+English and identifiers.\n\
+- Examples: \"wo yong python xie daima\" -> \"我用python写代码\"; \"shiyongAI\" -> \
+\"使用AI\"; \"shijie\" -> \"世界\"; \"世界shijie\" -> \"世界世界\"; \"你好，shijie\" -> \
+\"你好，世界\".\n\
+- If the input is empty or has no pinyin, return it unchanged.";
+
+/// Every past value of [`DEFAULT_SYSTEM_PROMPT`], verbatim, oldest first.
+///
+/// A config file carries its own copy of the prompt, so a user who has launched
+/// the app even once still holds the text they were first given. This list is
+/// how that text is recognised on load: an exact match means "never customised",
+/// and the current default replaces it. Anything else is a user's own edit and
+/// is left alone — which is why the comparison is byte-for-byte and why an entry
+/// must never be edited after the fact, only appended to.
+pub const LEGACY_SYSTEM_PROMPTS: &[&str] = &[
+    // The original, before a few-shot list existed at all.
+    "\
+Convert toneless Hanyu Pinyin into the single most natural sentence. The input \
+may MIX pinyin with English words, numbers, emails, URLs, and code identifiers: \
+convert the pinyin parts to Chinese and keep the non-pinyin parts verbatim. Use \
+spaces and context to tell pinyin from English; an apostrophe only marks a pinyin \
+syllable boundary (xi'an = 西安).\n\
+Rules:\n\
+- Output ONLY the result: no explanation, quotes, extra whitespace, or \
+alternatives.\n\
+- Convert pinyin to Chinese; keep English words, numbers, emails, URLs, and code \
+identifiers exactly as written.\n\
+- Use full-width Chinese punctuation amid Chinese; keep ASCII punctuation inside \
+English and identifiers.\n\
+- Example: \"wo yong python xie daima\" -> \"我用python写代码\".\n\
+- If the input is empty or has no pinyin, return it unchanged.",
+    // The version that added the two examples above, and still said nothing about
+    // Chinese in the input. Superseded when word selection made that a real
+    // input shape: without this entry, a stock install would keep the prompt that
+    // tells the model to convert *everything*, and would silently re-convert the
+    // words the user had just chosen.
+    "\
+Convert toneless Hanyu Pinyin into the single most natural sentence. The input \
 may MIX pinyin with English words, numbers, emails, URLs, and code identifiers: \
 convert the pinyin parts to Chinese and keep the non-pinyin parts verbatim. Use \
 spaces and context to tell pinyin from English; an apostrophe only marks a pinyin \
@@ -64,31 +120,8 @@ run is pinyin, as usual.\n\
 English and identifiers.\n\
 - Examples: \"wo yong python xie daima\" -> \"我用python写代码\"; \"shiyongAI\" -> \
 \"使用AI\".\n\
-- If the input is empty or has no pinyin, return it unchanged.";
-
-/// Every past value of [`DEFAULT_SYSTEM_PROMPT`], verbatim, oldest first.
-///
-/// A config file carries its own copy of the prompt, so a user who has launched
-/// the app even once still holds the text they were first given. This list is
-/// how that text is recognised on load: an exact match means "never customised",
-/// and the current default replaces it. Anything else is a user's own edit and
-/// is left alone — which is why the comparison is byte-for-byte and why an entry
-/// must never be edited after the fact, only appended to.
-pub const LEGACY_SYSTEM_PROMPTS: &[&str] = &["\
-Convert toneless Hanyu Pinyin into the single most natural sentence. The input \
-may MIX pinyin with English words, numbers, emails, URLs, and code identifiers: \
-convert the pinyin parts to Chinese and keep the non-pinyin parts verbatim. Use \
-spaces and context to tell pinyin from English; an apostrophe only marks a pinyin \
-syllable boundary (xi'an = 西安).\n\
-Rules:\n\
-- Output ONLY the result: no explanation, quotes, extra whitespace, or \
-alternatives.\n\
-- Convert pinyin to Chinese; keep English words, numbers, emails, URLs, and code \
-identifiers exactly as written.\n\
-- Use full-width Chinese punctuation amid Chinese; keep ASCII punctuation inside \
-English and identifiers.\n\
-- Example: \"wo yong python xie daima\" -> \"我用python写代码\".\n\
-- If the input is empty or has no pinyin, return it unchanged."];
+- If the input is empty or has no pinyin, return it unchanged.",
+];
 
 /// Instruction for the context-compaction call. The conversion history is folded
 /// into a short "scene" note that then rides in front of every later request.

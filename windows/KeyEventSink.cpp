@@ -90,7 +90,29 @@ bool IsFullWidthKey(bool english, wchar_t ch) {
     return !english && FullWidthPunct(ch) != 0;
 }
 
+// Which digit selects which candidate. Candidate 0 is labelled 2, so the labels
+// run 2..9.
+//
+// The digit row is spelled with the ASCII characters, not VK_2..VK_9: the SDK's
+// winuser.h only *documents* that VK_0..VK_9 are the same as '0'..'9' — it does
+// not define the macros, so naming them does not compile.
+int CandidateIndex(WPARAM vk) {
+    if (vk < static_cast<WPARAM>('2') || vk > static_cast<WPARAM>('9')) return -1;
+    return static_cast<int>(vk) - static_cast<int>('2');
+}
+
+bool IsCandidateKey(bool english, WPARAM vk) {
+    return !english && CandidateIndex(vk) >= 0;
+}
+
 }  // namespace
+
+// Does that digit have a candidate to pick? Asked by both phases (see below), so
+// the two cannot disagree about whether a digit selects or types.
+bool CTextService::_HasCandidateFor(WPARAM vk) const {
+    const int n = CandidateIndex(vk);
+    return n >= 0 && !_cands.empty() && static_cast<size_t>(n) < _cands.size();
+}
 
 // ---- ITfKeyEventSink::OnSetFocus (foreground/background) -------------------
 
@@ -143,6 +165,16 @@ BOOL CTextService::_IsKeyEaten(ITfContext* /*pic*/, WPARAM wParam, LPARAM lParam
         default:
             break;
     }
+
+    // A digit that would pick a candidate. This has to be answered here and not
+    // just in _HandleKey: the test phase is what the host asks to find out
+    // whether we want the key, and disagreeing with the handler means the host
+    // types the digit itself and the buffer never learns about the choice.
+    //
+    // Only asked when the candidates are actually on screen. A digit with no
+    // candidate to pick falls through to the printable-character clause below and
+    // becomes part of the sentence, which is what a user typing "3" means.
+    if (IsCandidateKey(_englishMode, wParam) && _HasCandidateFor(wParam)) return TRUE;
 
     wchar_t ch = VkToChar(wParam, lParam);
     // Any bare a-z / apostrophe feeds the buffer. Shift is deliberately not
@@ -323,9 +355,47 @@ bool CTextService::_EnqueueIdleChar(ITfContext* pic, const std::wstring& text) {
     return true;
 }
 
+// The buffer's punctuation as the document should show it.
+//
+// The buffer stores the punctuation we own as ASCII, on the understanding that a
+// conversion hands it to the model, which renders it full-width. THIS path never
+// reaches the model — everything was picked from the dictionary, and what is left
+// of the buffer is punctuation — so the mapping has to happen here, or a sentence
+// the user built entirely from the dictionary lands with English commas in it.
+// Nine characters only, the same nine FullWidthPunct owns: letters, digits and
+// anything already full-width pass through untouched.
+std::wstring ToFullWidthPunct(const std::string& utf8) {
+    std::wstring wide = dsime::Utf8ToUtf16(utf8);
+    for (wchar_t& c : wide) {
+        if (c > 0 && c < 0x80) {
+            if (const wchar_t full = FullWidthPunct(c)) c = full;
+        }
+    }
+    return wide;
+}
+
 // Snapshot the buffer and the caret into a job for the queue.
 bool CTextService::_EnqueueConversion(ITfContext* pic) {
-    if (!_EnqueueJob(pic, _pinyin, std::wstring())) return false;
+    const std::string payload = _ConversionPayload();
+    if (payload.empty()) return false;
+
+    // Two shapes, decided by whether any pinyin is left. Words the user picked are
+    // already Chinese, so a buffer with nothing but chosen words needs no model
+    // call — it goes through the literal path, which reuses the existing queue,
+    // the existing write session and the existing InsertTextAtSelection, so the
+    // text lands in the document through exactly the path a comma already uses.
+    // Anything still unselected is a real conversion, and the model is told (in
+    // the system prompt) to keep the Chinese parts verbatim.
+    const bool all_chosen = _pinyin.empty();
+    if (all_chosen) {
+        // Full-width on the way out, not on the way in: the buffer's ASCII commas
+        // are what the segmenter sees, and a full-width one would be an opaque
+        // multi-byte span inside a sentence the user is still editing. Every other
+        // path out of here is written by the model, which does this for us.
+        if (!_EnqueueJob(pic, std::string(), ToFullWidthPunct(payload))) return false;
+    } else if (!_EnqueueJob(pic, payload, std::wstring())) {
+        return false;
+    }
 
     // The buffer now belongs to the queue. Close the zero-width composition so
     // nothing is left anchored at this caret while the user types the next
@@ -341,7 +411,10 @@ bool CTextService::_EnqueueConversion(ITfContext* pic) {
 // request to turn an unfinished fragment into Chinese is not what they asked for.
 // Same four steps as _EnqueueConversion, with the model left out of it.
 void CTextService::_FlushBufferAsLiteral(ITfContext* pic) {
-    if (_pinyin.empty()) return;
+    // The payload, not just _pinyin: words the user already chose are Chinese and
+    // belong on the document verbatim, exactly as the unfinished pinyin does.
+    const std::string payload = _ConversionPayload();
+    if (payload.empty()) return;
 
     // The preserved-key route can arrive before there is a context to anchor to.
     // Same treatment as a refused edit session — the buffer waits for a keystroke
@@ -356,7 +429,7 @@ void CTextService::_FlushBufferAsLiteral(ITfContext* pic) {
     // empty buffer would take the *conversion* path and mint a job with nothing
     // in it. The guard above is what keeps that out of reach; this stays explicit
     // because the discrimination is by content and reads like an accident.
-    if (_EnqueueJob(pic, std::string(), dsime::Utf8ToUtf16(_pinyin))) {
+    if (_EnqueueJob(pic, std::string(), dsime::Utf8ToUtf16(payload))) {
         _EndComposition(pic);
         _ClearTyping();
         // Posted, not called: see WM_DSIME_PUMP. This runs from the Ctrl+Space
@@ -460,7 +533,15 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
             // queue. The pinyin vanishes from the box immediately and the user
             // carries straight on with the next sentence; results land in the
             // document as they arrive, in order.
-            if (!_composing || _pinyin.empty()) {
+            //
+            // "_pinyin is empty" is NOT the same as "nothing to send". A buffer the
+            // user chose all the way through has no pinyin left and a payload of
+            // chosen Chinese, and that payload is the entire point of selecting —
+            // it goes down the literal path with no model call. Testing `_pinyin`
+            // alone sent it to the idle-character branch, which returned the key
+            // to the host when the queue was empty, and the words they had just
+            // picked vanished with a bare space in their place.
+            if (!_composing || (_pinyin.empty() && _chosen.empty())) {
                 // A literal space, with sentences still owed to this document:
                 // it has to queue behind them, or it lands in front of the
                 // sentence the user just committed. See _EnqueueIdleChar.
@@ -503,8 +584,21 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
         }
         case VK_BACK: {
             if (!_composing) { *pfEaten = FALSE; return S_OK; }
-            if (!_pinyin.empty()) _pinyin.pop_back();
-            if (_pinyin.empty()) {
+            if (!_pinyin.empty()) {
+                _pinyin.pop_back();
+                _Resegment();
+            } else if (!_UndoLastChoice()) {
+                // No pinyin and no choice to revert: the buffer really is empty.
+                _EndComposition(pic);
+                _ClearTyping();
+                return S_OK;
+            } else {
+                // Reverted a choice, so there is a buffer again — keep composing
+                // rather than ending the composition and immediately reopening it.
+                _UpdateInputBox();
+                return S_OK;
+            }
+            if (_pinyin.empty() && _chosen.empty()) {
                 // Nothing left to show or to anchor: drop the composition too.
                 _EndComposition(pic);
                 _ClearTyping();
@@ -514,6 +608,17 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
             return S_OK;
         }
         default: {
+            // A digit picks a dictionary candidate when one is on screen, and
+            // falls through to the ordinary character path when one is not. The
+            // test phase asked the same question (_HasCandidateFor), so reaching
+            // here with no candidate means the host was already told we would not
+            // take the key.
+            if (IsCandidateKey(_englishMode, wParam) && _HasCandidateFor(wParam) &&
+                _SelectCandidate(static_cast<size_t>(CandidateIndex(wParam)))) {
+                _UpdateInputBox();
+                return S_OK;
+            }
+
             wchar_t ch = VkToChar(wParam, lParam);
 
             // Idle: there is no buffer to add the character to, so it is either
@@ -632,6 +737,12 @@ HRESULT CTextService::_HandleKey(ITfContext* pic, WPARAM wParam, LPARAM lParam,
                 _composing = true;
             }
             _pinyin.push_back(ascii);
+            // Re-segment on every keystroke, so the candidate row is live. The
+            // dictionary is memory-mapped and the query is a binary search, which
+            // is what makes this affordable per character; _Resegment clears the
+            // list itself when there is no dictionary, so the box falls back to
+            // showing the buffer alone.
+            _Resegment();
             // Purely cosmetic from here: the buffer lives in the box, and the
             // document is not touched until Space.
             _UpdateInputBox();

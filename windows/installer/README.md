@@ -3,9 +3,16 @@
 A single, self-contained, elevated **universal installer** (`DSPinyinIMEInstaller.exe`)
 for the DS Pinyin IME TSF text service — the Windows counterpart to the macOS guided installer.
 
-It **embeds both the x64 and ARM64 builds**, detects the host architecture at run
-time, installs the matching set, registers the text service, and adds DS Pinyin IME to
-the user's Chinese (Simplified) keyboards.
+It **embeds both the x64 and ARM64 builds** (and one copy of the dictionary),
+detects the host architecture at run time, installs the matching set, registers the
+text service, and adds DS Pinyin IME to the user's Chinese (Simplified) keyboards.
+
+`dsime.lex` — the compiled pinyin dictionary behind segmentation and candidate
+selection — is **architecture-independent** (a table of UTF-8 words), so it is
+embedded once rather than per arch, and it is **required**: without it the IME
+installs and runs, but has no segmentation, no candidate row and no digit-key word
+selection. `build-installer.ps1` refuses to package without it, and the install
+fails rather than degrading.
 
 > Windows has no fat/universal binaries: a TSF text service is an in-proc COM DLL
 > loaded into each text-host process and must match that process's architecture.
@@ -17,7 +24,8 @@ the user's Chinese (Simplified) keyboards.
 ## What it does
 
 1. Extracts the host-arch payload (`dsime_tsf.dll`, `dsime.dll`,
-   `DSPinyinIMESettings.exe`) to `%ProgramFiles%\DS Pinyin IME`.
+   `DSPinyinIMESettings.exe`) plus the pinyin dictionary (`dsime.lex`) to
+   `%ProgramFiles%\DS Pinyin IME`.
 2. `regsvr32` the TSF DLL (the native-arch `regsvr32` matches the native-arch DLL).
 3. Adds the DS Pinyin IME profile to the user's `zh-Hans` language list.
 4. Copies *itself* into the install directory and records an

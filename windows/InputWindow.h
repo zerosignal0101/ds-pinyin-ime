@@ -16,6 +16,7 @@
 
 #include <windows.h>
 #include <string>
+#include <vector>
 
 class DSPinyinIMEBoxWnd {
 public:
@@ -34,7 +35,15 @@ public:
     // how many conversions are still queued; `failed` marks a queued sentence
     // that could not be written to the document (its text is on the clipboard).
     // An empty `pinyin` with nothing pending hides the box.
-    void SetContent(const std::wstring& pinyin, unsigned pending, bool failed);
+    // `pinyin` is the whole pre-edit: chosen words (already Chinese) followed by
+    // the pinyin still to be converted. `candidates` are the words offered for
+    // the segment the user can act on; empty means there is no dictionary, no
+    // match, or nothing left to choose, and the box is two lines as before.
+    //
+    // Candidate labels start at 2, so `candidates[0]` is drawn as "2". There is no
+    // label 1 and the digit 1 does not select.
+    void SetContent(const std::wstring& pinyin, unsigned pending, bool failed,
+                    const std::vector<std::wstring>& candidates);
 
     // Which mode the text service is in, drawn as a 中/英 marker on the status
     // line. `flash` additionally holds the box on screen even with an empty
@@ -72,7 +81,12 @@ private:
     // Measured in one place because _MeasureContent sizes the window and
     // _Repaint draws into it, and any disagreement between them shows up as one
     // line sitting on top of another.
-    void _LineHeights(HDC dc, int* outPinyinH, int* outBadgeH) const;
+    //
+    // Three lines now, because the candidate row is between the pre-edit and the
+    // status line — which is where a candidate window belongs, and where the eye
+    // already is. `outCandH` is 0 when there is no candidate row, so the two-line
+    // case is literally the same layout it always was.
+    void _LineHeights(HDC dc, int* outPinyinH, int* outCandH, int* outBadgeH) const;
     void _Repaint();
     // Recompute size from the current content, place relative to the anchor, and
     // show/hide. The single place that touches SetWindowPos.
@@ -87,6 +101,14 @@ private:
     unsigned _pending = 0;
     bool _failed = false;
 
+    // Candidate words for the segment the user can act on, in order. Empty means
+    // no row. Held as UTF-16 because this whole class is wide-only — the UTF-8
+    // -> UTF-16 conversion happens once, at SetContent, and nowhere below.
+    //
+    // Stored as words only (not "2你好") because the label is generated from the
+    // index, so the two can never disagree about which number goes with which word.
+    std::vector<std::wstring> _cands;
+
     // The mode marker, and whether it is currently holding the box open.
     bool _english = false;
     bool _flash = false;
@@ -95,6 +117,9 @@ private:
     // or the failure notice instead of both. Built in one place because the same
     // string decides the window's height and gets painted into it.
     std::wstring _StatusText() const;
+    // The candidate row's text, or empty when there is no row. Same reason as
+    // _StatusText: the same string sizes the window and is painted into it.
+    std::wstring _CandidateText() const;
 
     // Caret position in screen coordinates; empty (all zero) until the caller
     // supplies a plausible one.

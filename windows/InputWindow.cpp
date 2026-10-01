@@ -32,6 +32,9 @@ const int kBadgeGap = 2;
 const int kMaxWidthDip = 640;
 const int kAnchorGap = 2;  // between the caret and the box
 
+// Gap between two candidates on the candidate row.
+const wchar_t kCandSep[] = L"  ";
+
 const COLORREF kBg = RGB(255, 255, 255);
 const COLORREF kBorder = RGB(184, 184, 184);
 const COLORREF kText = RGB(28, 28, 28);
@@ -145,12 +148,16 @@ void DSPinyinIMEBoxWnd::SetAnchor(const RECT& caret) {
     if (_visible) _Relayout();
 }
 
-void DSPinyinIMEBoxWnd::SetContent(const std::wstring& pinyin, unsigned pending,
-                               bool failed) {
-    if (_pinyin == pinyin && _pending == pending && _failed == failed) return;
+void DSPinyinIMEBoxWnd::SetContent(const std::wstring& pinyin, unsigned pending, bool failed,
+                                   const std::vector<std::wstring>& candidates) {
+    if (_pinyin == pinyin && _pending == pending && _failed == failed &&
+        _cands == candidates) {
+        return;
+    }
     _pinyin = pinyin;
     _pending = pending;
     _failed = failed;
+    _cands = candidates;
     _ShowOrHide();
 }
 
@@ -172,6 +179,10 @@ void DSPinyinIMEBoxWnd::_ShowOrHide() {
     //   * `_flash`  — Ctrl+Space's mode notice, and Ctrl+Space is most often
     //     pressed with nothing on screen at all, which is the whole reason it
     //     announces itself. The caller's timer takes it back down.
+    //
+    // The candidate row needs no case of its own: candidates only exist while
+    // `_pinyin` is non-empty, so the test above already covers the situation
+    // where there is something to draw.
     if (_pinyin.empty() && _pending == 0 && !_failed && !_flash) {
         Hide();
         return;
@@ -198,6 +209,27 @@ std::wstring DSPinyinIMEBoxWnd::_StatusText() const {
         text += num;
     }
     return text;
+}
+
+// The candidate row: "2你好 3你们 4首要".
+//
+// Built in one place because the same string decides the window's width and gets
+// painted into it, exactly as _StatusText does for the line below.
+//
+// The label is the index plus two, never a stored string: that is the only way the
+// number and the word cannot drift apart, and it is why the first candidate shows
+// as "2" and there is no "1".
+std::wstring DSPinyinIMEBoxWnd::_CandidateText() const {
+    if (_cands.empty()) return std::wstring();
+    std::wstring out;
+    wchar_t label[8] = {};
+    for (size_t i = 0; i < _cands.size(); ++i) {
+        if (i > 0) out += kCandSep;
+        ::wsprintfW(label, L"%u", static_cast<unsigned>(i) + 2);
+        out += label;
+        out += _cands[i];
+    }
+    return out;
 }
 
 void DSPinyinIMEBoxWnd::Hide() {
@@ -228,8 +260,10 @@ void DSPinyinIMEBoxWnd::_EnsureFonts(int dpi) {
     _dpi = dpi;
 }
 
-void DSPinyinIMEBoxWnd::_LineHeights(HDC dc, int* outPinyinH, int* outBadgeH) const {
+void DSPinyinIMEBoxWnd::_LineHeights(HDC dc, int* outPinyinH, int* outCandH,
+                                    int* outBadgeH) const {
     *outPinyinH = 0;
+    *outCandH = 0;
     *outBadgeH = 0;
 
     if (!_pinyin.empty()) {
@@ -238,6 +272,20 @@ void DSPinyinIMEBoxWnd::_LineHeights(HDC dc, int* outPinyinH, int* outBadgeH) co
         ::GetTextMetricsW(dc, &tm);
         ::SelectObject(dc, old);
         *outPinyinH = static_cast<int>(tm.tmHeight);
+    }
+    // The candidate row gets the SAME face as the pre-edit line, and this is a
+    // deliberate change of heart. It used to share the status line's small font,
+    // on the grounds that a candidate is an annotation rather than the answer —
+    // which is true of the *document* (nothing is written until Space) and false
+    // of the *user* (these are the words they are about to press a digit for, and
+    // they were too small to read). Two lines at one size also stops the box
+    // reading as a main line with a footnote. Only the mode/pending line is small.
+    if (!_cands.empty()) {
+        HGDIOBJ old = ::SelectObject(dc, _font);
+        TEXTMETRICW tm = {};
+        ::GetTextMetricsW(dc, &tm);
+        ::SelectObject(dc, old);
+        *outCandH = static_cast<int>(tm.tmHeight);
     }
     // Unconditional, because the status line always carries the mode marker:
     // whenever the box is up, this line is on it. _MeasureContent and _Repaint
@@ -298,8 +346,9 @@ void DSPinyinIMEBoxWnd::_Repaint() {
     // set aside for it, and once the pending badge is there too it centres
     // straight on top of it.
     int pinyinH = 0;
+    int candH = 0;
     int badgeH = 0;
-    _LineHeights(mem, &pinyinH, &badgeH);
+    _LineHeights(mem, &pinyinH, &candH, &badgeH);
 
     int y = padY;
     if (!_pinyin.empty()) {
@@ -312,6 +361,20 @@ void DSPinyinIMEBoxWnd::_Repaint() {
                     DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
         ::SelectObject(mem, oldFont);
         y += pinyinH + Scaled(kBadgeGap, _dpi);
+    }
+
+    // The candidate row, in the same ink as the pre-edit above it: these are the
+    // words a digit will commit, and the mode/pending line below is what is
+    // secondary.
+    if (!_cands.empty()) {
+        const std::wstring cands = _CandidateText();
+        HGDIOBJ oldFont = ::SelectObject(mem, _font);
+        ::SetTextColor(mem, kText);
+        RECT line = {padX, y, w - padX, y + candH};
+        ::DrawTextW(mem, cands.c_str(), static_cast<int>(cands.size()), &line,
+                    DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+        ::SelectObject(mem, oldFont);
+        y += candH + Scaled(kBadgeGap, _dpi);
     }
 
     // Always drawn, and always at the full height _LineHeights reserved for it.
@@ -348,8 +411,9 @@ void DSPinyinIMEBoxWnd::_MeasureContent(int dpi, int* outW, int* outH) {
     // Heights come from the same place _Repaint gets them, so the window is
     // exactly as tall as what gets drawn into it.
     int pinyinH = 0;
+    int candH = 0;
     int badgeH = 0;
-    _LineHeights(dc, &pinyinH, &badgeH);
+    _LineHeights(dc, &pinyinH, &candH, &badgeH);
 
     if (!_pinyin.empty()) {
         HGDIOBJ old = ::SelectObject(dc, _font);
@@ -359,6 +423,22 @@ void DSPinyinIMEBoxWnd::_MeasureContent(int dpi, int* outW, int* outH) {
         ::SelectObject(dc, old);
         w = std::max(w, static_cast<int>(sz.cx));
         h += pinyinH;
+    }
+
+    if (!_cands.empty()) {
+        // Measured from the very string that gets painted, and capped at the box's
+        // maximum width by the layout step — a long candidate row is ellipsised
+        // rather than allowed to make the box span the screen.
+        const std::wstring cands = _CandidateText();
+        // The same face _Repaint paints this line with. Measuring in the small font
+        // and drawing in the main one is how a wider line ends up ellipsised by the
+        // box that was sized for the narrower reading of it.
+        HGDIOBJ old = ::SelectObject(dc, _font);
+        SIZE sz = {};
+        ::GetTextExtentPoint32W(dc, cands.c_str(), static_cast<int>(cands.size()), &sz);
+        ::SelectObject(dc, old);
+        w = std::max(w, static_cast<int>(sz.cx));
+        h += Scaled(kBadgeGap, _dpi) + candH;
     }
 
     {

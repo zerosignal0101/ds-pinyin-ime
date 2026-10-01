@@ -72,6 +72,7 @@
 #include <list>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "DsimeCore.h"
 
@@ -364,7 +365,65 @@ private:
     // Raw ASCII typed so far: lower-case pinyin letters, the apostrophe syllable
     // separator, and the punctuation we keep in the buffer (the model renders it
     // full-width). This never reaches the document — it is drawn in the box.
+    //
+    // Its meaning narrowed when word selection arrived: it is now only the
+    // **unselected tail**. Words the user has already chosen have been moved into
+    // `_chosen` and their pinyin deleted from here, which is why the segmenter is
+    // only ever asked about a buffer that starts at a word boundary.
     std::string _pinyin;
+
+    // ---- word selection (KeyEventSink.cpp, Composition.cpp) ------------------
+    //
+    // A word the user picked from the dictionary, in the order they picked it.
+    // These are NOT committed to the document: they accumulate here, and Space
+    // sends `chosen text + remaining pinyin` as one request. Selecting everything
+    // therefore costs no model call at all — the payload is already Chinese.
+    struct ChosenWord {
+        // The exact bytes the choice removed from `_pinyin` (letters only, no
+        // syllable separators), so Backspace restores the buffer verbatim.
+        std::string pinyin;
+        // What the user picked, preceded by any bytes in the buffer that stood in
+        // front of the word's segment. Those bytes are not part of the word but
+        // they are part of the sentence and they were typed *there*, so the
+        // payload concatenates them in this position rather than dropping them.
+        std::string text;
+    };
+    std::vector<ChosenWord> _chosen;
+
+    // Live segmentation of `_pinyin`, and the candidate list for the segment the
+    // user can act on (the first one). Both are recomputed on every keystroke by
+    // _Resegment, which is the only writer — the key handler and the box only
+    // read them, so there is never a second copy to drift.
+    dsime::SegResult _segs;
+    std::vector<std::string> _cands;   // candidate words, in order; index 0 is label 2
+    size_t _activeStart = 0;            // span of that segment in _pinyin, from ds_seg_start
+    size_t _activeLen = 0;              // one past its last byte — i.e. how much to consume
+
+    // Recompute `_segs` / `_cands` / the active span from `_pinyin`. Cheap and
+    // synchronous (the dictionary is mmap'd); called after anything that changes
+    // the buffer. Also called when there is no dictionary, where it just clears
+    // the candidate list.
+    void _Resegment();
+    // Whether virtual key `vk` names a candidate that is actually on screen.
+    // Both key phases ask this, because a test phase that disagrees with the
+    // handler is how the host ends up typing a digit the IME meant to consume.
+    bool _HasCandidateFor(WPARAM vk) const;
+    // The payload a Space should send: chosen words followed by the raw tail.
+    // Never displayed — the model sees the concatenation, the user sees
+    // _PreEditText.
+    std::string _ConversionPayload() const;
+    // What the floating box's first line shows: the same words, with the pinyin
+    // half broken into syllables along the segmentation the candidates came from.
+    std::string _PreEditText() const;
+    // Pick candidate `n` (0-based) of the active segment. False when there is no
+    // active segment or no such candidate — the caller then falls through to
+    // whatever the key would otherwise do.
+    bool _SelectCandidate(size_t n);
+    // Undo the most recent choice, putting its pinyin back. False if there is none.
+    bool _UndoLastChoice();
+    // Point the core at dsime.lex, once per process. Failure is not fatal: the IME
+    // simply runs without candidates.
+    void _InitLexicon();
 
     // TRUE while we own the keystroke stream: the buffer is being built and the
     // zero-width composition anchoring it is live. This — NOT the presence of

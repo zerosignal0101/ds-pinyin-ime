@@ -238,6 +238,80 @@ private:
     DsSession* s_ = nullptr;
 };
 
+// ---- Lexicon -----------------------------------------------------------------
+//
+// Segmentation and candidate lookup, mirroring the stateless `ds_lexicon_*` C
+// entry points. It is *not* part of Session and holds no conversion state: these
+// calls start no request and know nothing about the queue, so they can run on
+// every keystroke. Which words the user has already picked is the frontend's
+// business (see CTextService::_chosen), and the core only ever sees the
+// unselected tail.
+
+// One buffer's segmentation, owned. Freed on scope exit.
+class SegResult {
+public:
+    SegResult() = default;
+    ~SegResult() { Free(); }
+
+    SegResult(const SegResult&) = delete;
+    SegResult& operator=(const SegResult&) = delete;
+    SegResult(SegResult&& o) noexcept : r_(o.r_) { o.r_ = nullptr; }
+    SegResult& operator=(SegResult&& o) noexcept {
+        if (this != &o) { Free(); r_ = o.r_; o.r_ = nullptr; }
+        return *this;
+    }
+
+    // Segment `pinyin_utf8`. Returns false only on a NULL argument; a missing
+    // dictionary still succeeds, with one opaque segment and no candidates.
+    bool Segment(const std::string& pinyin_utf8) {
+        Free();
+        return ds_lexicon_segment(pinyin_utf8.c_str(), &r_) == 0 && r_ != nullptr;
+    }
+
+    void Free() {
+        if (r_) { ds_lexicon_free(r_); r_ = nullptr; }
+    }
+
+    bool valid() const { return r_ != nullptr; }
+    int32_t count() const { return r_ ? ds_seg_count(r_) : 0; }
+
+    bool HasWord(int32_t i) const { return r_ && ds_seg_has_word(r_, i) != 0; }
+    std::string Pinyin(int32_t i) const { return CStr(ds_seg_pinyin(r_, i)); }
+    std::string Best(int32_t i) const { return CStr(ds_seg_best(r_, i)); }
+
+    // Byte range of segment `i` in the string that was passed to Segment().
+    //
+    // This is NOT the length of Pinyin(i): a code is space-separated syllables
+    // ("mei you", 8 bytes) where the input is the letters the user typed
+    // ("meiyou", 6). Every use of a segment as a range into a caller-owned
+    // string has to go through these two, never the code.
+    int32_t Start(int32_t i) const { return r_ ? ds_seg_start(r_, i) : -1; }
+    int32_t End(int32_t i) const { return r_ ? ds_seg_end(r_, i) : -1; }
+
+    int32_t CandCount(int32_t i) const { return r_ ? ds_seg_cand_count(r_, i) : 0; }
+
+    // Candidate `n` (0-based) of segment `i`. The UI labels these from 2.
+    std::string Cand(int32_t i, int32_t n) const { return CStr(ds_seg_cand(r_, i, n)); }
+
+private:
+    static std::string CStr(const char* p) {
+        return p ? std::string(p) : std::string();
+    }
+    DsSegResult* r_ = nullptr;
+};
+
+// Whether a dictionary was found. False means the IME runs without candidates,
+// which is a supported state, not an error.
+inline bool LexiconAvailable() { return ds_lexicon_available() != 0; }
+
+// Tell the core where dsime.lex is. Once per process, before the first query;
+// a call after the dictionary is mapped is refused. The lexicon ships beside
+// dsime.dll (regsvr32 records the exact path the DLL registered from), so the
+// frontend passes that directory — see CTextService::_InitLexicon.
+inline bool LexiconSetPath(const std::string& path_utf8) {
+    return ds_lexicon_set_path(path_utf8.c_str()) == 0;
+}
+
 // Thread-local last-error string from the core, as UTF-16.
 inline std::wstring LastError() {
     return Utf8ToUtf16(ds_last_error());

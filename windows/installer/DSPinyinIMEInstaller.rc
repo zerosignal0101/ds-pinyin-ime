@@ -16,6 +16,10 @@ IDR_ARM64_TSF      RCDATA "..\\dist\\arm64\\dsime_tsf.dll"
 IDR_ARM64_CORE     RCDATA "..\\dist\\arm64\\dsime.dll"
 IDR_ARM64_SETTINGS RCDATA "..\\dist\\arm64\\DSPinyinIMESettings.exe"
 
+// The pinyin dictionary, once: architecture-independent (see resource.h). Not
+// optional — without it the IME installs fine and then has no candidates.
+IDR_DICT           RCDATA "..\\dist\\dsime.lex"
+
 // ---- The installer window ---------------------------------------------------
 IDD_INSTALLER DIALOGEX 0, 0, 380, 240
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
