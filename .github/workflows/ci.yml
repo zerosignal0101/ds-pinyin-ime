@@ -4,6 +4,32 @@ on:
   push:
     branches: [main, "feature/**"]
   pull_request:
+  # Manual runs, on any branch: `gh workflow run ci.yml --ref <branch>`.
+  #
+  # The push filter above is deliberately narrow, which leaves a real gap — work
+  # on a branch that is neither main nor feature/** (this one is
+  # space-to-convert) triggers nothing at all until it is opened as a PR. That is
+  # fine as a gate and useless for "does this branch build?", which is the question
+  # you have before opening the PR. Note that dispatch only works for branches of
+  # a workflow that exists on the DEFAULT branch, so a newly added trigger needs a
+  # push to main before it can be used on anything else.
+  workflow_dispatch:
+
+# The pinyin dictionary is compiled from the rime-frost sources, and which
+# revision of them is part of this build. Pinned to a commit rather than a branch
+# on purpose: `dsime.lex` is what a release ships, and "whatever master said
+# today" would make two builds of the same commit differ in the one file every
+# install carries. 87f9d40 is the revision the shipped dictionary was built from.
+# Only the three dictionaries dslex reads are checked out (sparse); the repo's
+# schemes, lua and opencc trees are megabytes this build never opens.
+env:
+  RIME_REPO: gaboolic/rime-frost
+  RIME_SHA: 87f9d40ce51eeb912d156b27bd2918c340110b03
+  # The dictionary's cache key. The rime-frost revision is appended where the key
+  # is built; this part is the *compiler's* output format. Change it and every
+  # entry goes stale at once — which is the point, and why it is stated here
+  # instead of inferred from a source file that may not have changed.
+  LEX_CACHE_KEY: dsime-lex-v1
 
 jobs:
   core:
@@ -28,6 +54,46 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
       - run: cargo build --release
+      # The segmenter's tests come in two groups: a fixture that CI can run on its
+      # own, and a group that needs a compiled dictionary and is skipped without
+      # one. Skipping is deliberate — it is what keeps this job green on a machine
+      # with no rime-frost — but it also means the *real* algorithm, the real
+      # weights and the real 600k-entry table are untested by this job as written.
+      # Compiling the dictionary here closes that, and it is the same artifact
+      # every other job in this file needs, so the cost is paid once and cached.
+      - name: Fetch the dictionary sources
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.RIME_REPO }}
+          ref: ${{ env.RIME_SHA }}
+          path: ${{ github.workspace }}/.ci/rime-frost
+          sparse-checkout: |
+            cn_dicts/base.dict.yaml
+            cn_dicts/ext.dict.yaml
+            cn_dicts/8105.dict.yaml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Restore the compiled dictionary
+        id: lex-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ci/dsime.lex
+          # The sources are pinned, so the revision *is* the cache key. ${{ github.sha }}
+          # is deliberately not in it: every push would miss, and this file is a
+          # pure function of the rime-frost revision alone.
+          key: ${{ env.LEX_CACHE_KEY }}-${{ env.RIME_SHA }}
+      - name: Compile the dictionary
+        if: steps.lex-cache.outputs.cache-hit != 'true'
+        run: >
+          cargo run --bin dslex --
+          "${{ github.workspace }}/.ci/dsime.lex"
+          "${{ github.workspace }}/.ci/rime-frost/cn_dicts/base.dict.yaml"
+          "${{ github.workspace }}/.ci/rime-frost/cn_dicts/ext.dict.yaml"
+          "${{ github.workspace }}/.ci/rime-frost/cn_dicts/8105.dict.yaml"
+      - name: Test against the real dictionary
+        env:
+          DSILEX_TEST_DICT: ${{ github.workspace }}/.ci/dsime.lex
+        run: cargo test --all
 
   nvidia-smoke:
     # Live end-to-end smoke test: convert pinyin via the NVIDIA-hosted
@@ -91,9 +157,66 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      # The dictionary, restored from the cache the core job populated (a miss
+      # here would just recompile it, so this is not a cross-job ordering
+      # dependency — only an optimisation). It has to be in dist/ BEFORE
+      # build.ps1 runs, because -SkipLexicon refuses to continue without it; and
+      # the reason to ask for that at all is that build.ps1 would otherwise
+      # recompile the 22 MB table inside the arch loop, once per arch.
+      - name: Fetch the dictionary sources
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.RIME_REPO }}
+          ref: ${{ env.RIME_SHA }}
+          path: ${{ github.workspace }}/.ci/rime-frost
+          sparse-checkout: |
+            cn_dicts/base.dict.yaml
+            cn_dicts/ext.dict.yaml
+            cn_dicts/8105.dict.yaml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Restore the compiled dictionary
+        id: lex-cache
+        uses: actions/cache@v4
+        with:
+          path: windows/dist/dsime.lex
+          key: ${{ env.LEX_CACHE_KEY }}-${{ env.RIME_SHA }}
+      - name: Compile the dictionary
+        if: steps.lex-cache.outputs.cache-hit != 'true'
+        working-directory: core
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ../windows/dist | Out-Null
+          cargo run --bin dslex -- `
+            "../windows/dist/dsime.lex" `
+            "${{ github.workspace }}/.ci/rime-frost/cn_dicts/base.dict.yaml" `
+            "${{ github.workspace }}/.ci/rime-frost/cn_dicts/ext.dict.yaml" `
+            "${{ github.workspace }}/.ci/rime-frost/cn_dicts/8105.dict.yaml"
+          if ($LASTEXITCODE -ne 0) { throw "dslex failed (exit $LASTEXITCODE)" }
       # Builds dsime.dll + the TSF text service. x64 only: the ARM64 build is
       # needed solely to make the universal installer, and release.yml does that
       # one. Gating for real now, so no continue-on-error.
-      - run: ./build.ps1 -Arch x64 -Generator Ninja
+      #
+      # DSIME_RIME_DIR is set per STEP, not on the job. build.ps1 reads it to find
+      # cn_dicts/*.dict.yaml, and a job-level `env` cannot mention the `runner`
+      # context at all — GitHub rejects the whole workflow at parse time with
+      # "Unrecognized named-value: 'runner'". Step-level env can.
+      - run: ./build.ps1 -Arch x64 -Generator Ninja -SkipLexicon
         shell: pwsh
         working-directory: windows
+        env:
+          DSIME_RIME_DIR: ${{ github.workspace }}/.ci/rime-frost
+      # The build is green either way — that was the problem. build.ps1 degrades to
+      # "no candidates" when the sources are absent, and a frontend DLL with no
+      # dictionary still compiles, links, stages and passes every test. So the
+      # assertion that the dictionary is in the artifact has to be explicit; the
+      # installer's resource compiler would catch it too, but as an obscure
+      # "cannot open file" from rc.exe.
+      - name: The staged build carries a dictionary
+        shell: pwsh
+        run: |
+          $lex = "windows/dist/dsime.lex"
+          if (-not (Test-Path $lex)) { throw "$lex was not produced" }
+          $mb = [math]::Round((Get-Item $lex).Length / 1MB, 1)
+          Write-Host "dsime.lex: $mb MB"
+          if ($mb -lt 5) { throw "dsime.lex is $mb MB — that is a truncated dictionary, not a real one" }

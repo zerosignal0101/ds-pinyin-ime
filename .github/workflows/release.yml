@@ -13,6 +13,14 @@ on:
 permissions:
   contents: write # the release job creates the GitHub release + uploads assets
 
+# Same pin as ci.yml, and the same reason: the dictionary is embedded in the
+# installer, so a release is only reproducible if the dictionary revision is part
+# of what the release *is*. See the comment block in ci.yml.
+env:
+  RIME_REPO: gaboolic/rime-frost
+  RIME_SHA: 87f9d40ce51eeb912d156b27bd2918c340110b03
+  LEX_CACHE_KEY: dsime-lex-v1
+
 jobs:
   windows-installer:
     name: Windows installer (x64 + ARM64)
@@ -25,10 +33,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core
+      - name: Fetch the dictionary sources
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.RIME_REPO }}
+          ref: ${{ env.RIME_SHA }}
+          path: ${{ github.workspace }}/.ci/rime-frost
+          sparse-checkout: |
+            cn_dicts/base.dict.yaml
+            cn_dicts/ext.dict.yaml
+            cn_dicts/8105.dict.yaml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Restore the compiled dictionary
+        id: lex-cache
+        uses: actions/cache@v4
+        with:
+          path: windows/dist/dsime.lex
+          key: ${{ env.LEX_CACHE_KEY }}-${{ env.RIME_SHA }}
+      - name: Compile the dictionary
+        if: steps.lex-cache.outputs.cache-hit != 'true'
+        working-directory: core
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ../windows/dist | Out-Null
+          cargo run --bin dslex -- `
+            "../windows/dist/dsime.lex" `
+            "${{ github.workspace }}/.ci/rime-frost/cn_dicts/base.dict.yaml" `
+            "${{ github.workspace }}/.ci/rime-frost/cn_dicts/ext.dict.yaml" `
+            "${{ github.workspace }}/.ci/rime-frost/cn_dicts/8105.dict.yaml"
+          if ($LASTEXITCODE -ne 0) { throw "dslex failed (exit $LASTEXITCODE)" }
       # CMake's VS-generator auto-discovery fails on the runner ("could not find
       # any instance of Visual Studio") from a plain shell. Instead set up the
       # MSVC env per-arch with msvc-dev-cmd and build each arch with the Ninja
       # (single-config) generator, which takes the target arch from that env.
+      #
+      # -SkipLexicon on both: dist/dsime.lex was restored or compiled above, and it
+      # is architecture-independent, so letting build.ps1 rebuild it here would pay
+      # 2-3 minutes per arch for a byte-identical file.
       - name: Set up MSVC (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -36,7 +78,11 @@ jobs:
       - name: Build core + TSF (x64)
         shell: pwsh
         working-directory: windows
-        run: ./build.ps1 -Arch x64 -Config Release -Generator Ninja
+        env:
+          # Step-level, not job-level: a job's `env` cannot reference the `runner`
+          # context, and GitHub refuses to parse the whole workflow if it tries.
+          DSIME_RIME_DIR: ${{ github.workspace }}/.ci/rime-frost
+        run: ./build.ps1 -Arch x64 -Config Release -Generator Ninja -SkipLexicon
       - name: Set up MSVC (ARM64 cross)
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -44,7 +90,9 @@ jobs:
       - name: Build core + TSF (arm64)
         shell: pwsh
         working-directory: windows
-        run: ./build.ps1 -Arch arm64 -Config Release -Generator Ninja
+        env:
+          DSIME_RIME_DIR: ${{ github.workspace }}/.ci/rime-frost
+        run: ./build.ps1 -Arch arm64 -Config Release -Generator Ninja -SkipLexicon
       # Package the universal installer (always x64) with the x64 env active.
       - name: Set up MSVC (x64) for installer
         uses: ilammy/msvc-dev-cmd@v1
