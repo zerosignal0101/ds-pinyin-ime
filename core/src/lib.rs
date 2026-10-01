@@ -454,12 +454,24 @@ use lexicon::{Lexicon, MAX_CANDIDATES};
 /// The process-wide dictionary, opened on first use.
 static LEXICON: OnceLock<Option<Lexicon>> = OnceLock::new();
 
-thread_local! {
-    /// Set by `ds_lexicon_set_path` before the dictionary is first mapped. A
-    /// thread-local so a frontend that never sets a path does not race one that
-    /// does, and so the `OnceLock` is never initialised from a bare default.
-    static LEXICON_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-}
+/// Where to map the dictionary from. Process-wide, set once, and NOT a
+/// thread-local — the first version was, on the reasoning that a frontend which
+/// never sets a path should not race one that does. That is not what a
+/// thread-local buys; it is a path written on one thread and read on another.
+///
+/// The dictionary belongs to the process, not to a thread: a TSF frontend sets
+/// the path on its STA thread and then asks for candidates wherever the next key
+/// event lands, and a test binary asks from every thread at once. So the thread
+/// that happens to reach `LEXICON.get_or_init` first reads *its own* copy of the
+/// path, finds it empty, falls back to the default location, fails to open it —
+/// and pins that failure for the life of the process, because a `OnceLock` is
+/// never re-initialised. Every later caller then sees "no dictionary" for a
+/// dictionary that is sitting on disk, named on the command line.
+///
+/// It surfaced as all five ABI tests failing on the Windows runner and passing
+/// on Ubuntu, which is the shape of a race rather than of a bug: whichever test
+/// thread won the race was the one that decided the answer for all of them.
+static LEXICON_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Opaque handle: one buffer's segmentation, owned by the caller.
 ///
@@ -494,7 +506,8 @@ fn lexicon() -> Option<&'static Lexicon> {
     LEXICON
         .get_or_init(|| {
             let path = LEXICON_PATH
-                .with(|p| p.borrow().clone())
+                .get()
+                .cloned()
                 .unwrap_or_else(default_lexicon_path);
             match Lexicon::open(&path) {
                 Ok(l) => Some(l),
@@ -534,7 +547,20 @@ pub unsafe extern "C" fn ds_lexicon_set_path(utf8_path: *const c_char) -> i32 {
         set_last_error("ds_lexicon_set_path: the dictionary is already mapped");
         return DS_ERR_CONFIG;
     }
-    LEXICON_PATH.with(|p| *p.borrow_mut() = Some(PathBuf::from(s)));
+    let path = PathBuf::from(s);
+    // Setting the SAME path again is fine, and has to be: callers that cannot
+    // know whether someone else in the process got there first (every thread of
+    // a test binary, say) would otherwise have to treat the second call as an
+    // error it did nothing wrong about. A *different* path is the real
+    // contradiction, and it is refused.
+    if let Some(already) = LEXICON_PATH.get() {
+        if *already == path {
+            return DS_OK;
+        }
+        set_last_error("ds_lexicon_set_path: a different dictionary is already configured");
+        return DS_ERR_CONFIG;
+    }
+    let _ = LEXICON_PATH.set(path);
     DS_OK
 }
 

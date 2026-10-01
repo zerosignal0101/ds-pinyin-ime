@@ -190,6 +190,54 @@ fn abi_reports_single_syllable_candidates() {
     assert!(unsafe { ds_lexicon_candidates(unknown.as_ptr()) }.is_null());
 }
 
+/// The dictionary is process-wide, so the path has to be too.
+///
+/// Regression: `LEXICON_PATH` used to be a `thread_local!`, which made this a
+/// path *written on one thread and read on another*. Whichever of the threads
+/// below reached the mapping first read its own (empty) copy, fell back to the
+/// default location, failed, and pinned that failure for the whole process — so
+/// every test in the binary failed, and only on the runner that happened to
+/// schedule them the other way round. The bug is invisible single-threaded,
+/// which is why it shipped.
+#[test]
+fn abi_survives_being_configured_from_another_thread() {
+    if std::env::var("DSILEX_TEST_DICT").is_err() {
+        return;
+    }
+    let path = std::ffi::CString::new(std::env::var("DSILEX_TEST_DICT").unwrap()).unwrap();
+
+    // Race several threads to be the one that reads the dictionary. The winner is
+    // arbitrary; the answer must not be.
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let p = path.clone();
+            std::thread::spawn(move || {
+                let rc = unsafe { ds_lexicon_set_path(p.as_ptr()) };
+                // Both outcomes are correct and neither is this test's business:
+                // accepted if nothing has mapped a dictionary yet, refused because
+                // one already has. What must never happen is a refusal that leaves
+                // the process without a dictionary it was told about.
+                if rc != DS_OK {
+                    assert_eq!(
+                        ds_lexicon_available(),
+                        1,
+                        "a refused set_path must mean the dictionary is already mapped"
+                    );
+                }
+                ds_lexicon_available()
+            })
+        })
+        .collect();
+
+    for h in handles {
+        assert_eq!(
+            h.join().expect("thread panicked"),
+            1,
+            "a dictionary named on the command line must map whatever thread asks first"
+        );
+    }
+}
+
 #[test]
 fn abi_rejects_a_second_set_path() {
     if !open_or_skip() {
